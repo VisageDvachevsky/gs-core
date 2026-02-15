@@ -48,3 +48,5 @@ secrets.json
 
 # WebRTC artifacts (large)
 third_party/libwebrtc/out/
+DEVELOPMENT_PLAN.md
+DEVELOPMENT_PRINCIPLES.md
