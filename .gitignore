@@ -1,0 +1,50 @@
+# C++ build artifacts
+build/
+out/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.lib
+*.exe
+*.ilk
+*.pdb
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+
+# IDE
+.vscode/
+.idea/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+
+# Node.js
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs and secrets
+*.log
+.env
+.env.local
+secrets.json
+
+# WebRTC artifacts (large)
+third_party/libwebrtc/out/
