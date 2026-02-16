@@ -2,6 +2,8 @@
 #include <iostream>
 #include <chrono>
 #include <format>
+#include <mutex>
+#include <condition_variable>
 
 // D3D11 first
 #include <d3d11.h>
@@ -50,6 +52,12 @@ public:
     // State
     bool is_initialized_ = false;
     CaptureStats stats_{};
+    winrt::Windows::Foundation::SizeInt32 current_size_{};
+
+    // Event sync
+    std::mutex frame_mutex_;
+    std::condition_variable frame_cv_;
+    bool has_new_frame_ = false;
 
     // Helper methods
     bool init_d3d11_device();
@@ -57,6 +65,7 @@ public:
     bool init_capture_item(uint32_t window_handle);
     bool init_frame_pool();
     bool start_capture_session();
+    void recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 new_size);
 };
 
 WGCCapture::WGCCapture() : impl_(std::make_unique<WGCCaptureImpl>()) {}
@@ -123,11 +132,16 @@ bool WGCCaptureImpl::init_d3d11_device() {
     D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL featureLevel;
 
+    UINT create_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifdef _DEBUG
+    create_flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
     HRESULT hr = D3D11CreateDevice(
         nullptr,
         D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        create_flags,
         featureLevels,
         ARRAYSIZE(featureLevels),
         D3D11_SDK_VERSION,
@@ -201,21 +215,42 @@ bool WGCCaptureImpl::init_capture_item(uint32_t window_handle) {
 }
 
 bool WGCCaptureImpl::init_frame_pool() {
-    auto size = capture_item_.Size();
+    current_size_ = capture_item_.Size();
 
     try {
-        frame_pool_ = wgc::Direct3D11CaptureFramePool::Create(
+        frame_pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
             direct3d_device_,
             wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,  // Number of buffers
-            size
+            current_size_
         );
+
+        // Subscribe to FrameArrived event for frame synchronization and resize handling
+        frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
+            std::unique_lock lock(frame_mutex_);
+
+            // Check for resize
+            auto frame = sender.TryGetNextFrame();
+            if (!frame) return;
+
+            auto new_size = frame.ContentSize();
+            if (new_size.Width != current_size_.Width || new_size.Height != current_size_.Height) {
+                std::cout << std::format("[WGC] Window resized: {}x{} -> {}x{}\n",
+                    current_size_.Width, current_size_.Height, new_size.Width, new_size.Height);
+                recreate_frame_pool(new_size);
+                current_size_ = new_size;
+            }
+
+            has_new_frame_ = true;
+            frame_cv_.notify_one();
+        });
+
     } catch (const winrt::hresult_error& e) {
-        std::cerr << std::format("[WGC] Direct3D11CaptureFramePool::Create failed: 0x{:08X}\n", static_cast<uint32_t>(e.code()));
+        std::cerr << std::format("[WGC] Direct3D11CaptureFramePool::CreateFreeThreaded failed: 0x{:08X}\n", static_cast<uint32_t>(e.code()));
         return false;
     }
 
-    std::cout << "[WGC] Frame pool created\n";
+    std::cout << "[WGC] Frame pool created with FrameArrived event handler\n";
     return true;
 }
 
@@ -232,12 +267,64 @@ bool WGCCaptureImpl::start_capture_session() {
     return true;
 }
 
+void WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 new_size) {
+    // Close old frame pool
+    if (frame_pool_) {
+        frame_pool_.Close();
+    }
+
+    // Recreate with new size
+    frame_pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        direct3d_device_,
+        wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        2,
+        new_size
+    );
+
+    // Re-subscribe to FrameArrived
+    frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
+        std::unique_lock lock(frame_mutex_);
+
+        auto frame = sender.TryGetNextFrame();
+        if (!frame) return;
+
+        auto frame_size = frame.ContentSize();
+        if (frame_size.Width != current_size_.Width || frame_size.Height != current_size_.Height) {
+            std::cout << std::format("[WGC] Window resized: {}x{} -> {}x{}\n",
+                current_size_.Width, current_size_.Height, frame_size.Width, frame_size.Height);
+            recreate_frame_pool(frame_size);
+            current_size_ = frame_size;
+        }
+
+        has_new_frame_ = true;
+        frame_cv_.notify_one();
+    });
+
+    // Restart capture session with new pool
+    if (capture_session_) {
+        capture_session_.Close();
+    }
+    capture_session_ = frame_pool_.CreateCaptureSession(capture_item_);
+    capture_session_.StartCapture();
+}
+
 Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
     if (!impl_->is_initialized_) {
         return Result<CaptureFrame>::error("Not initialized");
     }
 
     auto start = std::chrono::steady_clock::now();
+
+    // Wait for new frame with timeout (event-based)
+    {
+        std::unique_lock lock(impl_->frame_mutex_);
+        if (!impl_->frame_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                       [&] { return impl_->has_new_frame_; })) {
+            impl_->stats_.frames_skipped++;
+            return Result<CaptureFrame>::error("timeout");
+        }
+        impl_->has_new_frame_ = false;
+    }
 
     // Try to get next frame from pool
     try {
@@ -246,10 +333,10 @@ Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
         return Result<CaptureFrame>::error(std::format("TryGetNextFrame failed: 0x{:08X}", static_cast<uint32_t>(e.code())));
     }
 
-    // If no frame available, timeout
+    // Double-check frame is valid
     if (!impl_->current_frame_) {
         impl_->stats_.frames_skipped++;
-        return Result<CaptureFrame>::error("timeout");
+        return Result<CaptureFrame>::error("no frame after signal");
     }
 
     // Get D3D11 surface from frame
@@ -271,6 +358,10 @@ Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
     D3D11_TEXTURE2D_DESC desc;
     wrl_texture->GetDesc(&desc);
 
+    // Use SystemRelativeTime from frame (synchronized with DWM compositor)
+    auto frame_timestamp_100ns = impl_->current_frame_.SystemRelativeTime().count();
+    uint64_t pts_us = frame_timestamp_100ns / 10;  // Convert 100ns to microseconds
+
     // Update statistics
     auto elapsed = std::chrono::steady_clock::now() - start;
     double capture_ms = std::chrono::duration<double, std::milli>(elapsed).count();
@@ -284,9 +375,7 @@ Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
     impl_->current_capture_frame_.texture = wrl_texture;
     impl_->current_capture_frame_.width = desc.Width;
     impl_->current_capture_frame_.height = desc.Height;
-    impl_->current_capture_frame_.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()
-    ).count();
+    impl_->current_capture_frame_.timestamp_us = pts_us;
 
     return impl_->current_capture_frame_;
 }
