@@ -108,7 +108,7 @@ gamestream/
 - **Результат**: Каждый слой копирования = +3–10 мс задержки
 
 ### Почему AMF, а не NVIDIA/Intel?
-Твой **RX 6700 XT** имеет VCN 3.0 (Video Coding Engine 3.0), что дает **1-кадровую задержку** вместо 2–3 кадров у NVENC.
+Моя **RX 6700 XT** имеет VCN 3.0 (Video Coding Engine 3.0), что дает **1-кадровую задержку** вместо 2–3 кадров у NVENC.
 
 ### Почему WebRTC, а не RTMP?
 WebRTC: <2 сек задержка, встроенное NAT traversal
@@ -148,5 +148,5 @@ DXGI DuplicateOutput не работает в Fullscreen Exclusive — это о
 
 ---
 
-**Status**: 🟢 Ready for PHASE 1
+**Status**: 🟢 PHASE 1 
 **Last Updated**: 2026-02-15
