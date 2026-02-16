@@ -48,5 +48,10 @@ secrets.json
 
 # WebRTC artifacts (large)
 third_party/libwebrtc/out/
-DEVELOPMENT_PLAN.md
-DEVELOPMENT_PRINCIPLES.md
+
+# Test artifacts (PHASE 1)
+*.bmp
+*.h264
+*.mp4
+frame_*.bmp
+build_log.txt
