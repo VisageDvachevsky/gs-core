@@ -82,10 +82,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 bool InitD3D11(HWND hwnd) {
+    // Get window size
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+
     // Create device and swap chain
     DXGI_SWAP_CHAIN_DESC1 scd{};
-    scd.Width = 1280;
-    scd.Height = 720;
+    scd.Width = width;
+    scd.Height = height;
     scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -142,11 +148,13 @@ bool InitD3D11(HWND hwnd) {
 
     // Set viewport
     D3D11_VIEWPORT viewport{};
-    viewport.Width = 1280.0f;
-    viewport.Height = 720.0f;
+    viewport.Width = static_cast<float>(width);
+    viewport.Height = static_cast<float>(height);
     viewport.MinDepth = 0.0f;
     viewport.MaxDepth = 1.0f;
     g_context->RSSetViewports(1, &viewport);
+
+    std::cout << std::format("[D3D11] Fullscreen borderless: {}x{}\n", width, height);
 
     return true;
 }
@@ -300,14 +308,18 @@ int main() {
     wc.lpszClassName = L"D3D11TestRenderer";
     RegisterClassExW(&wc);
 
-    // Create window
+    // Get monitor resolution for fullscreen borderless
+    int screen_width = GetSystemMetrics(SM_CXSCREEN);
+    int screen_height = GetSystemMetrics(SM_CYSCREEN);
+
+    // Create fullscreen borderless window
     g_hwnd = CreateWindowExW(
-        0,
+        WS_EX_TOPMOST,  // Always on top
         L"D3D11TestRenderer",
-        L"D3D11 Test Renderer - Rotating Square",
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        1280, 720,
+        L"D3D11 Test Renderer - FULLSCREEN (Press ESC to exit)",
+        WS_POPUP,  // Borderless
+        0, 0,
+        screen_width, screen_height,
         nullptr,
         nullptr,
         wc.hInstance,
