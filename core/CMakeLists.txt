@@ -60,14 +60,23 @@ if(TARGET fmt::fmt)
     target_link_libraries(capture_test PRIVATE fmt::fmt)
 endif()
 
+# 60 FPS Loop Test executable
+add_executable(fps_loop_test
+    src/capture/dxgi_capture.cpp
+    tools/fps_loop_test.cpp
+    ${CAPTURE_HEADERS}
+)
+target_link_libraries(fps_loop_test PRIVATE ${WIN_LIBS})
+
 # Set output directory
-set_target_properties(capture_test PROPERTIES
+set_target_properties(capture_test fps_loop_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
 # Enable warnings
 if(MSVC)
     target_compile_options(capture_test PRIVATE /W4 /WX-)
+    target_compile_options(fps_loop_test PRIVATE /W4 /WX-)
 endif()
 
 message(STATUS "GameStream Core - CMake Configuration")
