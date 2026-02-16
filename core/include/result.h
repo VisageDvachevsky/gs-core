@@ -3,6 +3,7 @@
 #include <string>
 #include <variant>
 #include <optional>
+#include <cassert>
 
 namespace gamestream {
 
@@ -33,9 +34,18 @@ public:
     explicit operator bool() const { return has_value(); }
 
     // Get value (undefined if error)
-    T& value() & { return std::get<T>(data_); }
-    const T& value() const & { return std::get<T>(data_); }
-    T&& value() && { return std::move(std::get<T>(data_)); }
+    T& value() & {
+        assert(has_value() && "Result::value() called on error state");
+        return std::get<T>(data_);
+    }
+    const T& value() const & {
+        assert(has_value() && "Result::value() called on error state");
+        return std::get<T>(data_);
+    }
+    T&& value() && {
+        assert(has_value() && "Result::value() called on error state");
+        return std::move(std::get<T>(data_));
+    }
 
     // Get error message (undefined if success)
     const std::string& error() const { return std::get<std::string>(data_); }

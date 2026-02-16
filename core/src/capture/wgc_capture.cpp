@@ -1,5 +1,5 @@
 #include "wgc_capture.h"
-#include <iostream>
+#include <spdlog/spdlog.h>
 #include <chrono>
 #include <format>
 #include <mutex>
@@ -58,11 +58,13 @@ public:
     std::mutex frame_mutex_;
     std::condition_variable frame_cv_;
     bool has_new_frame_ = false;
+    bool resize_pending_ = false;
+    winrt::Windows::Foundation::SizeInt32 pending_size_{};
 
     // Helper methods
     bool init_d3d11_device();
     bool init_direct3d_device();
-    bool init_capture_item(uint32_t window_handle);
+    bool init_capture_item(uintptr_t window_handle);
     bool init_frame_pool();
     bool start_capture_session();
     void recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 new_size);
@@ -89,7 +91,7 @@ WGCCapture::~WGCCapture() {
 }
 
 VoidResult WGCCapture::initialize(uint32_t window_handle) {
-    std::cout << "[WGC] Initializing Windows.Graphics.Capture...\n";
+    spdlog::debug("[WGC] Initializing Windows.Graphics.Capture...");
 
     // Initialize WinRT apartment
     try {
@@ -109,7 +111,7 @@ VoidResult WGCCapture::initialize(uint32_t window_handle) {
     }
 
     // Step 3: Create capture item from window
-    if (!impl_->init_capture_item(window_handle)) {
+    if (!impl_->init_capture_item(static_cast<uintptr_t>(window_handle))) {
         return VoidResult::error("Failed to create GraphicsCaptureItem");
     }
 
@@ -124,7 +126,7 @@ VoidResult WGCCapture::initialize(uint32_t window_handle) {
     }
 
     impl_->is_initialized_ = true;
-    std::cout << "[WGC] Initialized successfully\n";
+    spdlog::info("[WGC] Initialized successfully");
     return {};
 }
 
@@ -151,11 +153,11 @@ bool WGCCaptureImpl::init_d3d11_device() {
     );
 
     if (FAILED(hr)) {
-        std::cerr << std::format("[WGC] D3D11CreateDevice failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
+        spdlog::error("[WGC] D3D11CreateDevice failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    std::cout << "[WGC] D3D11 device created\n";
+    spdlog::debug("[WGC] D3D11 device created");
     return true;
 }
 
@@ -163,37 +165,37 @@ bool WGCCaptureImpl::init_direct3d_device() {
     ComPtr<IDXGIDevice> dxgiDevice;
     HRESULT hr = d3d11_device_.As(&dxgiDevice);
     if (FAILED(hr)) {
-        std::cerr << std::format("[WGC] QueryInterface for IDXGIDevice failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
+        spdlog::error("[WGC] QueryInterface for IDXGIDevice failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     winrt::com_ptr<::IInspectable> inspectable;
     hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.Get(), inspectable.put());
     if (FAILED(hr)) {
-        std::cerr << std::format("[WGC] CreateDirect3D11DeviceFromDXGIDevice failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
+        spdlog::error("[WGC] CreateDirect3D11DeviceFromDXGIDevice failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     direct3d_device_ = inspectable.as<wd3d::IDirect3DDevice>();
-    std::cout << "[WGC] Direct3D device created\n";
+    spdlog::debug("[WGC] Direct3D device created");
     return true;
 }
 
-bool WGCCaptureImpl::init_capture_item(uint32_t window_handle) {
-    HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(window_handle));
+bool WGCCaptureImpl::init_capture_item(uintptr_t window_handle) {
+    HWND hwnd = reinterpret_cast<HWND>(window_handle);
 
     // If no window specified, use foreground window
     if (hwnd == nullptr) {
         hwnd = GetForegroundWindow();
         if (hwnd == nullptr) {
-            std::cerr << "[WGC] No foreground window found\n";
+            spdlog::error("[WGC] No foreground window found");
             return false;
         }
     }
 
     WCHAR windowTitle[256];
     GetWindowTextW(hwnd, windowTitle, 256);
-    std::wcout << L"[WGC] Capturing window: " << windowTitle << L"\n";
+    spdlog::debug(L"[WGC] Capturing window: {}", windowTitle);
 
     // Create capture item from window
     auto interop = winrt::get_activation_factory<wgc::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
@@ -205,12 +207,12 @@ bool WGCCaptureImpl::init_capture_item(uint32_t window_handle) {
             winrt::put_abi(capture_item_)
         ));
     } catch (const winrt::hresult_error& e) {
-        std::cerr << std::format("[WGC] CreateForWindow failed: 0x{:08X}\n", static_cast<uint32_t>(e.code()));
+        spdlog::error("[WGC] CreateForWindow failed: 0x{:08X}", static_cast<uint32_t>(e.code()));
         return false;
     }
 
     auto size = capture_item_.Size();
-    std::cout << std::format("[WGC] Capture item created: {}x{}\n", size.Width, size.Height);
+    spdlog::info("[WGC] Capture item created: {}x{}", size.Width, size.Height);
     return true;
 }
 
@@ -225,20 +227,24 @@ bool WGCCaptureImpl::init_frame_pool() {
             current_size_
         );
 
-        // Subscribe to FrameArrived event for frame synchronization and resize handling
         frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
             std::unique_lock lock(frame_mutex_);
 
-            // Check for resize
             auto frame = sender.TryGetNextFrame();
-            if (!frame) return;
+            if (!frame) {
+                has_new_frame_ = true;
+                frame_cv_.notify_one();
+                return;
+            }
 
             auto new_size = frame.ContentSize();
+
             if (new_size.Width != current_size_.Width || new_size.Height != current_size_.Height) {
-                std::cout << std::format("[WGC] Window resized: {}x{} -> {}x{}\n",
+                spdlog::info("[WGC] Window resized: {}x{} -> {}x{}",
                     current_size_.Width, current_size_.Height, new_size.Width, new_size.Height);
-                recreate_frame_pool(new_size);
-                current_size_ = new_size;
+
+                resize_pending_ = true;
+                pending_size_ = new_size;
             }
 
             has_new_frame_ = true;
@@ -246,11 +252,11 @@ bool WGCCaptureImpl::init_frame_pool() {
         });
 
     } catch (const winrt::hresult_error& e) {
-        std::cerr << std::format("[WGC] Direct3D11CaptureFramePool::CreateFreeThreaded failed: 0x{:08X}\n", static_cast<uint32_t>(e.code()));
+        spdlog::error("[WGC] Direct3D11CaptureFramePool::CreateFreeThreaded failed: 0x{:08X}", static_cast<uint32_t>(e.code()));
         return false;
     }
 
-    std::cout << "[WGC] Frame pool created with FrameArrived event handler\n";
+    spdlog::debug("[WGC] Frame pool created with FrameArrived event handler");
     return true;
 }
 
@@ -259,11 +265,11 @@ bool WGCCaptureImpl::start_capture_session() {
         capture_session_ = frame_pool_.CreateCaptureSession(capture_item_);
         capture_session_.StartCapture();
     } catch (const winrt::hresult_error& e) {
-        std::cerr << std::format("[WGC] StartCapture failed: 0x{:08X}\n", static_cast<uint32_t>(e.code()));
+        spdlog::error("[WGC] StartCapture failed: 0x{:08X}", static_cast<uint32_t>(e.code()));
         return false;
     }
 
-    std::cout << "[WGC] Capture session started\n";
+    spdlog::debug("[WGC] Capture session started");
     return true;
 }
 
@@ -286,14 +292,20 @@ void WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 n
         std::unique_lock lock(frame_mutex_);
 
         auto frame = sender.TryGetNextFrame();
-        if (!frame) return;
+        if (!frame) {
+            has_new_frame_ = true;
+            frame_cv_.notify_one();
+            return;
+        }
 
         auto frame_size = frame.ContentSize();
+
         if (frame_size.Width != current_size_.Width || frame_size.Height != current_size_.Height) {
-            std::cout << std::format("[WGC] Window resized: {}x{} -> {}x{}\n",
+            spdlog::info("[WGC] Window resized: {}x{} -> {}x{}",
                 current_size_.Width, current_size_.Height, frame_size.Width, frame_size.Height);
-            recreate_frame_pool(frame_size);
-            current_size_ = frame_size;
+
+            resize_pending_ = true;
+            pending_size_ = frame_size;
         }
 
         has_new_frame_ = true;
@@ -306,11 +318,19 @@ void WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 n
     }
     capture_session_ = frame_pool_.CreateCaptureSession(capture_item_);
     capture_session_.StartCapture();
+
+    current_size_ = new_size;
 }
 
 Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
     if (!impl_->is_initialized_) {
         return Result<CaptureFrame>::error("Not initialized");
+    }
+
+    // Handle resize if pending 
+    if (impl_->resize_pending_) {
+        impl_->recreate_frame_pool(impl_->pending_size_);
+        impl_->resize_pending_ = false;
     }
 
     auto start = std::chrono::steady_clock::now();

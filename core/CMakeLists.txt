@@ -103,9 +103,9 @@ set_target_properties(capture_test fps_loop_test wgc_test PROPERTIES
 
 # Enable warnings
 if(MSVC)
-    target_compile_options(capture_test PRIVATE /W4 /WX-)
-    target_compile_options(fps_loop_test PRIVATE /W4 /WX-)
-    target_compile_options(wgc_test PRIVATE /W4 /WX-)
+    target_compile_options(capture_test PRIVATE /W4 /WX)
+    target_compile_options(fps_loop_test PRIVATE /W4 /WX)
+    target_compile_options(wgc_test PRIVATE /W4 /WX)
 endif()
 
 message(STATUS "GameStream Core - CMake Configuration")

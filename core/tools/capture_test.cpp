@@ -1,4 +1,5 @@
 #include "dxgi_capture.h"
+#include <wrl/client.h>
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -7,6 +8,7 @@
 
 using namespace gamestream;
 using namespace std::chrono;
+using Microsoft::WRL::ComPtr;
 
 int main() {
     // Initialize COM (required for WIC)
@@ -70,15 +72,13 @@ int main() {
 
         CaptureFrame& frame = result.value();
 
-        ID3D11Device* device = nullptr;
-        ID3D11DeviceContext* context = nullptr;
+        // Use ComPtr for RAII (no manual Release needed)
+        ComPtr<ID3D11Device> device;
+        ComPtr<ID3D11DeviceContext> context;
         frame.texture->GetDevice(&device);
         device->GetImmediateContext(&context);
 
-        bool saved = DXGICapture::save_texture_to_bmp(device, context, frame.texture.Get(), filename.str());
-
-        device->Release();
-        context->Release();
+        bool saved = DXGICapture::save_texture_to_bmp(device.Get(), context.Get(), frame.texture.Get(), filename.str());
 
         capture.release_frame();
 
