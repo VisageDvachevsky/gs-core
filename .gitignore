@@ -55,3 +55,8 @@ third_party/libwebrtc/out/
 *.mp4
 frame_*.bmp
 build_log.txt
+
+# Experiments (keep .md docs, ignore builds)
+experiments/**/build/
+experiments/**/*.exe
+experiments/**/*.obj

@@ -134,6 +134,19 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
     width_ = output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left;
     height_ = output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top;
 
+    // Get display mode to check refresh rate
+    DXGI_MODE_DESC mode_desc{};
+    mode_desc.Width = width_;
+    mode_desc.Height = height_;
+    mode_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+    DXGI_MODE_DESC closest_mode{};
+    hr = output_->FindClosestMatchingMode(&mode_desc, &closest_mode, nullptr);
+    if (SUCCEEDED(hr)) {
+        double refresh_rate = static_cast<double>(closest_mode.RefreshRate.Numerator) / closest_mode.RefreshRate.Denominator;
+        std::cout << std::format("[DXGI] Monitor refresh rate: {:.2f} Hz\n", refresh_rate);
+    }
+
     // Create desktop duplication using standard DuplicateOutput API
     hr = output_->DuplicateOutput(device_.Get(), &duplication_);
 
