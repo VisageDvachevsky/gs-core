@@ -1,11 +1,16 @@
 #pragma once
 
+#include "iframe_capture.h"
+#include "result.h"
+#include "capture_types.h"
+
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <chrono>
 
 using Microsoft::WRL::ComPtr;
 
@@ -17,33 +22,41 @@ struct CaptureConfig {
     bool find_amd_gpu = true;    // Automatically find AMD GPU
 };
 
-class DXGICapture {
+/// DXGI Desktop Duplication implementation
+class DXGICapture : public IFrameCapture {
 public:
     DXGICapture() = default;
     ~DXGICapture();
 
-    // Initialize DXGI capture
-    bool Initialize(const CaptureConfig& config = {});
+    // Non-copyable (holds COM resources)
+    DXGICapture(const DXGICapture&) = delete;
+    DXGICapture& operator=(const DXGICapture&) = delete;
 
-    // Capture next frame
-    // Returns true if frame captured, false if timeout or error
-    bool CaptureFrame(ID3D11Texture2D** out_texture, uint64_t timeout_ms = 16);
+    // Movable
+    DXGICapture(DXGICapture&&) noexcept = default;
+    DXGICapture& operator=(DXGICapture&&) noexcept = default;
 
-    // Release current frame (must be called after CaptureFrame)
-    void ReleaseFrame();
+    // IFrameCapture interface
+    VoidResult initialize(uint32_t adapter_index = 0) override;
+    Result<CaptureFrame> acquire_frame(uint64_t timeout_ms = 16) override;
+    void release_frame() override;
+    void get_resolution(uint32_t& width, uint32_t& height) const override;
+    bool is_initialized() const override { return duplication_ != nullptr; }
+    CaptureStats get_stats() const override { return stats_; }
 
-    // Get capture resolution
-    void GetResolution(uint32_t& width, uint32_t& height) const;
+    // Additional DXGI-specific methods
+    bool initialize_with_config(const CaptureConfig& config);
+    bool recreate_duplication();
 
-    // Check if initialized
-    bool IsInitialized() const { return duplication_ != nullptr; }
-
-    // Recreate duplication (call after DXGI_ERROR_ACCESS_LOST)
-    bool RecreateDuplication();
+    // Utility: Save texture to BMP file using WIC
+    static bool save_texture_to_bmp(ID3D11Device* device,
+                                    ID3D11DeviceContext* context,
+                                    ID3D11Texture2D* texture,
+                                    const std::wstring& filepath);
 
 private:
-    bool CreateDevice(uint32_t adapter_index, bool find_amd);
-    bool CreateDuplication(uint32_t output_index);
+    bool create_device(uint32_t adapter_index, bool find_amd);
+    bool create_duplication(uint32_t output_index);
 
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
@@ -56,12 +69,10 @@ private:
 
     CaptureConfig config_;
     bool frame_acquired_ = false;
-};
 
-// Utility: Save texture to BMP file using WIC
-bool SaveTextureToBMP(ID3D11Device* device,
-                      ID3D11DeviceContext* context,
-                      ID3D11Texture2D* texture,
-                      const std::wstring& filepath);
+    // Statistics
+    CaptureStats stats_;
+    std::chrono::steady_clock::time_point start_time_;
+};
 
 } // namespace gamestream

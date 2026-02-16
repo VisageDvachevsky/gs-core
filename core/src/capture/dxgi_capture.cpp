@@ -2,26 +2,39 @@
 #include <iostream>
 #include <vector>
 #include <wincodec.h>
+#include <format>
 
 namespace gamestream {
 
 DXGICapture::~DXGICapture() {
     if (frame_acquired_) {
-        ReleaseFrame();
+        release_frame();
     }
 }
 
-bool DXGICapture::Initialize(const CaptureConfig& config) {
+VoidResult DXGICapture::initialize(uint32_t adapter_index) {
+    CaptureConfig config;
+    config.adapter_index = adapter_index;
+    config.find_amd_gpu = true;
+
+    if (!initialize_with_config(config)) {
+        return VoidResult::error("Failed to initialize DXGI capture");
+    }
+    return {};
+}
+
+bool DXGICapture::initialize_with_config(const CaptureConfig& config) {
     config_ = config;
+    start_time_ = std::chrono::steady_clock::now();
 
     // Step 1: Create D3D11 device on the correct adapter
-    if (!CreateDevice(config.adapter_index, config.find_amd_gpu)) {
+    if (!create_device(config.adapter_index, config.find_amd_gpu)) {
         std::cerr << "[DXGI] Failed to create D3D11 device\n";
         return false;
     }
 
     // Step 2: Create desktop duplication
-    if (!CreateDuplication(config.output_index)) {
+    if (!create_duplication(config.output_index)) {
         std::cerr << "[DXGI] Failed to create desktop duplication\n";
         return false;
     }
@@ -30,12 +43,12 @@ bool DXGICapture::Initialize(const CaptureConfig& config) {
     return true;
 }
 
-bool DXGICapture::CreateDevice(uint32_t adapter_index, bool find_amd) {
+bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
     // Create DXGI factory
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), &factory);
     if (FAILED(hr)) {
-        std::cerr << "[DXGI] CreateDXGIFactory1 failed: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[DXGI] CreateDXGIFactory1 failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -48,7 +61,7 @@ bool DXGICapture::CreateDevice(uint32_t adapter_index, bool find_amd) {
         adapter->GetDesc1(&desc);
 
         std::wcout << L"[DXGI] Adapter " << i << L": " << desc.Description << L"\n";
-        std::wcout << L"       VendorID: 0x" << std::hex << desc.VendorId << std::dec << L"\n";
+        std::wcout << std::format(L"       VendorID: 0x{:04X}\n", desc.VendorId);
 
         // Check if this is AMD (VendorId = 0x1002)
         if (find_amd && desc.VendorId == 0x1002) {
@@ -92,7 +105,7 @@ bool DXGICapture::CreateDevice(uint32_t adapter_index, bool find_amd) {
     );
 
     if (FAILED(hr)) {
-        std::cerr << "[DXGI] D3D11CreateDevice failed: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[DXGI] D3D11CreateDevice failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -100,11 +113,11 @@ bool DXGICapture::CreateDevice(uint32_t adapter_index, bool find_amd) {
     return true;
 }
 
-bool DXGICapture::CreateDuplication(uint32_t output_index) {
+bool DXGICapture::create_duplication(uint32_t output_index) {
     // Get output from adapter
     HRESULT hr = adapter_->EnumOutputs(output_index, reinterpret_cast<IDXGIOutput**>(output_.GetAddressOf()));
     if (FAILED(hr)) {
-        std::cerr << "[DXGI] EnumOutputs failed: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[DXGI] EnumOutputs failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -125,7 +138,7 @@ bool DXGICapture::CreateDuplication(uint32_t output_index) {
     hr = output_->DuplicateOutput(device_.Get(), &duplication_);
 
     if (FAILED(hr)) {
-        std::cerr << "[DXGI] DuplicateOutput failed: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[DXGI] DuplicateOutput failed: 0x{:08X}\n", static_cast<uint32_t>(hr));
         if (hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) {
             std::cerr << "[DXGI] Too many applications using desktop duplication (max 1-2)\n";
         } else if (hr == DXGI_ERROR_UNSUPPORTED) {
@@ -138,15 +151,17 @@ bool DXGICapture::CreateDuplication(uint32_t output_index) {
     return true;
 }
 
-bool DXGICapture::CaptureFrame(ID3D11Texture2D** out_texture, uint64_t timeout_ms) {
+Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
     if (!duplication_) {
-        return false;
+        return Result<CaptureFrame>::error("Duplication not initialized");
     }
 
     // Release previous frame if still held
     if (frame_acquired_) {
-        ReleaseFrame();
+        release_frame();
     }
+
+    auto start = std::chrono::steady_clock::now();
 
     ComPtr<IDXGIResource> resource;
     DXGI_OUTDUPL_FRAME_INFO frame_info;
@@ -159,53 +174,70 @@ bool DXGICapture::CaptureFrame(ID3D11Texture2D** out_texture, uint64_t timeout_m
 
     // Handle timeout (no new frame)
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // Not an error - screen didn't change
-        return false;
+        stats_.frames_skipped++;
+        return Result<CaptureFrame>::error("timeout");  // Not an error, screen didn't change
     }
 
     // Handle access lost (resolution change, mode switch, etc.)
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         std::cout << "[DXGI] Access lost, attempting to recreate duplication...\n";
-        RecreateDuplication();
-        return false;
+        recreate_duplication();
+        return Result<CaptureFrame>::error("access_lost");
     }
 
     if (FAILED(hr)) {
-        std::cerr << "[DXGI] AcquireNextFrame failed: 0x" << std::hex << hr << "\n";
-        return false;
+        return Result<CaptureFrame>::error(std::format("AcquireNextFrame failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     // Get texture from resource
     ComPtr<ID3D11Texture2D> texture;
     hr = resource.As(&texture);
     if (FAILED(hr)) {
-        std::cerr << "[DXGI] Failed to get texture from resource: 0x" << std::hex << hr << "\n";
         duplication_->ReleaseFrame();
-        return false;
+        return Result<CaptureFrame>::error(std::format("Failed to get texture: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
-    *out_texture = texture.Detach();
     frame_acquired_ = true;
-    return true;
+
+    // Update statistics
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    double capture_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+
+    stats_.frames_captured++;
+    stats_.avg_capture_ms = (stats_.avg_capture_ms * (stats_.frames_captured - 1) + capture_ms) / stats_.frames_captured;
+    if (capture_ms < stats_.min_capture_ms) stats_.min_capture_ms = capture_ms;
+    if (capture_ms > stats_.max_capture_ms) stats_.max_capture_ms = capture_ms;
+
+    // Calculate timestamp
+    auto now = std::chrono::steady_clock::now();
+    uint64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time_).count();
+
+    CaptureFrame frame;
+    frame.texture = texture;
+    frame.width = width_;
+    frame.height = height_;
+    frame.timestamp_us = timestamp_us;
+
+    return frame;
 }
 
-void DXGICapture::ReleaseFrame() {
+void DXGICapture::release_frame() {
     if (duplication_ && frame_acquired_) {
         duplication_->ReleaseFrame();
         frame_acquired_ = false;
     }
 }
 
-void DXGICapture::GetResolution(uint32_t& width, uint32_t& height) const {
+void DXGICapture::get_resolution(uint32_t& width, uint32_t& height) const {
     width = width_;
     height = height_;
 }
 
-bool DXGICapture::RecreateDuplication() {
+bool DXGICapture::recreate_duplication() {
     duplication_.Reset();
     frame_acquired_ = false;
 
-    if (CreateDuplication(config_.output_index)) {
+    if (create_duplication(config_.output_index)) {
         std::cout << "[DXGI] Duplication recreated successfully\n";
         return true;
     }
@@ -214,11 +246,11 @@ bool DXGICapture::RecreateDuplication() {
     return false;
 }
 
-// Utility function: Save texture to BMP using WIC
-bool SaveTextureToBMP(ID3D11Device* device,
-                      ID3D11DeviceContext* context,
-                      ID3D11Texture2D* texture,
-                      const std::wstring& filepath) {
+// Static utility function: Save texture to BMP using WIC
+bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
+                                      ID3D11DeviceContext* context,
+                                      ID3D11Texture2D* texture,
+                                      const std::wstring& filepath) {
     HRESULT hr;
 
     // Get texture description
@@ -235,7 +267,7 @@ bool SaveTextureToBMP(ID3D11Device* device,
     ComPtr<ID3D11Texture2D> staging_texture;
     hr = device->CreateTexture2D(&staging_desc, nullptr, &staging_texture);
     if (FAILED(hr)) {
-        std::cerr << "[WIC] Failed to create staging texture: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[WIC] Failed to create staging texture: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -246,7 +278,7 @@ bool SaveTextureToBMP(ID3D11Device* device,
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = context->Map(staging_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
-        std::cerr << "[WIC] Failed to map staging texture: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[WIC] Failed to map staging texture: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -260,7 +292,7 @@ bool SaveTextureToBMP(ID3D11Device* device,
     );
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
-        std::cerr << "[WIC] Failed to create WIC factory: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[WIC] Failed to create WIC factory: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -275,7 +307,7 @@ bool SaveTextureToBMP(ID3D11Device* device,
     hr = stream->InitializeFromFilename(filepath.c_str(), GENERIC_WRITE);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
-        std::cerr << "[WIC] Failed to create output file: " << std::hex << hr << "\n";
+        std::cerr << std::format("[WIC] Failed to create output file: {:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -333,7 +365,7 @@ bool SaveTextureToBMP(ID3D11Device* device,
     context->Unmap(staging_texture.Get(), 0);
 
     if (FAILED(hr)) {
-        std::cerr << "[WIC] Failed to write pixels: 0x" << std::hex << hr << "\n";
+        std::cerr << std::format("[WIC] Failed to write pixels: 0x{:08X}\n", static_cast<uint32_t>(hr));
         return false;
     }
 

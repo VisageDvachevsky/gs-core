@@ -33,10 +33,19 @@ set(WIN_LIBS
     kernel32.lib
 )
 
+# Header files
+set(CAPTURE_HEADERS
+    include/result.h
+    include/capture_types.h
+    include/iframe_capture.h
+    include/dxgi_capture.h
+)
+
 # Source files for DXGI capture test
 set(CAPTURE_TEST_SOURCES
     src/capture/dxgi_capture.cpp
     tools/capture_test.cpp
+    ${CAPTURE_HEADERS}
 )
 
 # DXGI Capture Test executable

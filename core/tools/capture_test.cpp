@@ -25,7 +25,7 @@ int main() {
     CaptureConfig config;
     config.find_amd_gpu = true;  // Automatically find AMD RX 6700 XT
 
-    if (!capture.Initialize(config)) {
+    if (!capture.initialize_with_config(config)) {
         std::cerr << "\nFailed to initialize DXGI capture!\n";
         std::cerr << "\nPossible issues:\n";
         std::cerr << "  - Game is in Fullscreen Exclusive mode (use Borderless Windowed)\n";
@@ -36,7 +36,7 @@ int main() {
     }
 
     uint32_t width, height;
-    capture.GetResolution(width, height);
+    capture.get_resolution(width, height);
     std::cout << "\nCapture resolution: " << width << "x" << height << "\n";
 
     // Capture 10 frames
@@ -51,13 +51,12 @@ int main() {
     for (int i = 0; i < num_frames; ) {
         auto frame_start = steady_clock::now();
 
-        // Capture frame
-        ID3D11Texture2D* texture = nullptr;
-        bool captured = capture.CaptureFrame(&texture, 1000);  // 1 second timeout
+        // Capture frame using Result<T>
+        auto result = capture.acquire_frame(1000);  // 1 second timeout
 
-        if (!captured) {
+        if (!result) {
             frames_skipped++;
-            std::cout << "  [Frame " << (i + 1) << "] Skipped (no change or timeout)\n";
+            std::cout << "  [Frame " << (i + 1) << "] Skipped (" << result.error() << ")\n";
             std::this_thread::sleep_for(milliseconds(16));  // Wait ~1 frame at 60Hz
             continue;
         }
@@ -69,18 +68,19 @@ int main() {
         std::wstringstream filename;
         filename << L"frame_" << std::setw(3) << std::setfill(L'0') << (i + 1) << L".bmp";
 
+        CaptureFrame& frame = result.value();
+
         ID3D11Device* device = nullptr;
         ID3D11DeviceContext* context = nullptr;
-        texture->GetDevice(&device);
+        frame.texture->GetDevice(&device);
         device->GetImmediateContext(&context);
 
-        bool saved = SaveTextureToBMP(device, context, texture, filename.str());
+        bool saved = DXGICapture::save_texture_to_bmp(device, context, frame.texture.Get(), filename.str());
 
         device->Release();
         context->Release();
-        texture->Release();
 
-        capture.ReleaseFrame();
+        capture.release_frame();
 
         auto save_time = steady_clock::now();
         double save_ms = duration<double, std::milli>(save_time - capture_time).count();
@@ -104,6 +104,9 @@ int main() {
     auto end_time = steady_clock::now();
     double total_seconds = duration<double>(end_time - start_time).count();
 
+    // Get statistics
+    auto stats = capture.get_stats();
+
     std::cout << "\n===========================================\n";
     std::cout << "  Capture Summary\n";
     std::cout << "===========================================\n";
@@ -111,6 +114,10 @@ int main() {
     std::cout << "Frames skipped:  " << frames_skipped << "\n";
     std::cout << "Total time:      " << std::fixed << std::setprecision(2) << total_seconds << "s\n";
     std::cout << "Average FPS:     " << (frames_captured / total_seconds) << "\n";
+    std::cout << "\nCapture Statistics:\n";
+    std::cout << "  Avg latency:  " << std::setprecision(3) << stats.avg_capture_ms << " ms\n";
+    std::cout << "  Min latency:  " << stats.min_capture_ms << " ms\n";
+    std::cout << "  Max latency:  " << stats.max_capture_ms << " ms\n";
     std::cout << "\nCheck the current directory for frame_001.bmp ... frame_010.bmp\n";
 
     CoUninitialize();
