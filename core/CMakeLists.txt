@@ -8,6 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Windows SDK version (we have 10.0.26100.0)
 set(CMAKE_SYSTEM_VERSION "10.0.26100.0")
 
+# Windows SDK paths for WinRT
+set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10")
+set(WINDOWS_SDK_VERSION "10.0.26100.0")
+
 # Find packages
 find_package(spdlog CONFIG)
 find_package(fmt CONFIG)
@@ -22,6 +26,8 @@ endif()
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${AMF_SDK_DIR}/amf/public/include
+    "${WINDOWS_SDK_PATH}/Include/${WINDOWS_SDK_VERSION}/cppwinrt"
+    "${WINDOWS_SDK_PATH}/Include/${WINDOWS_SDK_VERSION}/winrt"
 )
 
 # Windows libraries
@@ -33,12 +39,19 @@ set(WIN_LIBS
     kernel32.lib
 )
 
+# WinRT libraries (for WGC)
+set(WINRT_LIBS
+    windowsapp.lib
+    onecore.lib
+)
+
 # Header files
 set(CAPTURE_HEADERS
     include/result.h
     include/capture_types.h
     include/iframe_capture.h
     include/dxgi_capture.h
+    include/wgc_capture.h
 )
 
 # Source files for DXGI capture test
@@ -68,8 +81,23 @@ add_executable(fps_loop_test
 )
 target_link_libraries(fps_loop_test PRIVATE ${WIN_LIBS})
 
+# WGC Capture Test executable
+add_executable(wgc_test
+    src/capture/wgc_capture.cpp
+    tools/wgc_test.cpp
+    ${CAPTURE_HEADERS}
+)
+target_link_libraries(wgc_test PRIVATE ${WIN_LIBS} ${WINRT_LIBS})
+
+# Enable C++/WinRT for wgc_test
+target_compile_options(wgc_test PRIVATE
+    /await:strict
+    /EHsc
+    /permissive-
+)
+
 # Set output directory
-set_target_properties(capture_test fps_loop_test PROPERTIES
+set_target_properties(capture_test fps_loop_test wgc_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
@@ -77,6 +105,7 @@ set_target_properties(capture_test fps_loop_test PROPERTIES
 if(MSVC)
     target_compile_options(capture_test PRIVATE /W4 /WX-)
     target_compile_options(fps_loop_test PRIVATE /W4 /WX-)
+    target_compile_options(wgc_test PRIVATE /W4 /WX-)
 endif()
 
 message(STATUS "GameStream Core - CMake Configuration")
