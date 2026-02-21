@@ -4,6 +4,8 @@
 #include <wincodec.h>
 #include <format>
 
+using Microsoft::WRL::ComPtr;
+
 namespace gamestream {
 
 DXGICapture::~DXGICapture() {
@@ -12,9 +14,10 @@ DXGICapture::~DXGICapture() {
     }
 }
 
-VoidResult DXGICapture::initialize(uint32_t adapter_index) {
+VoidResult DXGICapture::initialize(uintptr_t adapter_index) {
     CaptureConfig config;
-    config.adapter_index = adapter_index;
+    // adapter_index fits comfortably in uint32_t; cast is safe for any realistic index value.
+    config.adapter_index = static_cast<uint32_t>(adapter_index);
     config.find_amd_gpu = true;
 
     if (!initialize_with_config(config)) {
@@ -27,13 +30,11 @@ bool DXGICapture::initialize_with_config(const CaptureConfig& config) {
     config_ = config;
     start_time_ = std::chrono::steady_clock::now();
 
-    // Step 1: Create D3D11 device on the correct adapter
     if (!create_device(config.adapter_index, config.find_amd_gpu)) {
         spdlog::error("[DXGI] Failed to create D3D11 device");
         return false;
     }
 
-    // Step 2: Create desktop duplication
     if (!create_duplication(config.output_index)) {
         spdlog::error("[DXGI] Failed to create desktop duplication");
         return false;
@@ -44,7 +45,6 @@ bool DXGICapture::initialize_with_config(const CaptureConfig& config) {
 }
 
 bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
-    // Create DXGI factory
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), &factory);
     if (FAILED(hr)) {
@@ -52,7 +52,6 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
         return false;
     }
 
-    // Enumerate adapters to find AMD GPU
     ComPtr<IDXGIAdapter1> adapter;
     uint32_t current_index = 0;
 
@@ -60,16 +59,21 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
 
-        spdlog::debug(L"[DXGI] Adapter {}: {} (VendorID: 0x{:04X})", i, desc.Description, desc.VendorId);
+        // Convert WCHAR description to UTF-8 for spdlog (no SPDLOG_WCHAR_TO_UTF8_SUPPORT needed)
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                                               nullptr, 0, nullptr, nullptr);
+        std::string desc_utf8(static_cast<size_t>(needed), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                            desc_utf8.data(), needed, nullptr, nullptr);
 
-        // Check if this is AMD (VendorId = 0x1002)
-        if (find_amd && desc.VendorId == 0x1002) {
-            spdlog::info(L"[DXGI] Found AMD GPU, using adapter {}", i);
+        spdlog::debug("[DXGI] Adapter {}: {} (VendorID: 0x{:04X})", i, desc_utf8, desc.VendorId);
+
+        if (find_amd && desc.VendorId == 0x1002) {  // AMD vendor ID
+            spdlog::info("[DXGI] Found AMD GPU: {} (adapter {})", desc_utf8, i);
             adapter_ = adapter;
             break;
         }
 
-        // If not finding AMD specifically, use the requested index
         if (!find_amd && current_index == adapter_index) {
             adapter_ = adapter;
             break;
@@ -83,13 +87,13 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
         return false;
     }
 
-    // Create D3D11 device with BGRA support (required for WGC compatibility and WIC encoding)
     D3D_FEATURE_LEVEL feature_levels[] = {
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0
     };
     D3D_FEATURE_LEVEL feature_level;
 
+    // D3D11_CREATE_DEVICE_BGRA_SUPPORT required for WGC compatibility and WIC encoding.
     UINT create_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
     create_flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -97,7 +101,7 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
 
     hr = D3D11CreateDevice(
         adapter_.Get(),
-        D3D_DRIVER_TYPE_UNKNOWN,  // Use adapter, not HARDWARE
+        D3D_DRIVER_TYPE_UNKNOWN,  // Must be UNKNOWN when an explicit adapter is provided
         nullptr,
         create_flags,
         feature_levels,
@@ -118,7 +122,7 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
 }
 
 bool DXGICapture::create_duplication(uint32_t output_index) {
-    // Get output from adapter (first as IDXGIOutput, then QueryInterface to IDXGIOutput1)
+    // EnumOutputs returns IDXGIOutput; QueryInterface up to IDXGIOutput1 for DuplicateOutput1.
     ComPtr<IDXGIOutput> output;
     HRESULT hr = adapter_->EnumOutputs(output_index, &output);
     if (FAILED(hr)) {
@@ -126,40 +130,50 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
         return false;
     }
 
-    // QueryInterface to IDXGIOutput1 (required for DuplicateOutput1)
     hr = output.As(&output_);
     if (FAILED(hr)) {
         spdlog::error("[DXGI] QueryInterface to IDXGIOutput1 failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Get output description
     DXGI_OUTPUT_DESC output_desc;
     output_->GetDesc(&output_desc);
-    spdlog::debug(L"[DXGI] Output: {} at ({}, {}) to ({}, {})",
-        output_desc.DeviceName,
-        output_desc.DesktopCoordinates.left,
-        output_desc.DesktopCoordinates.top,
-        output_desc.DesktopCoordinates.right,
-        output_desc.DesktopCoordinates.bottom);
 
-    width_ = output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left;
-    height_ = output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top;
+    // Convert WCHAR device name to UTF-8 for spdlog
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, output_desc.DeviceName, -1,
+                                           nullptr, 0, nullptr, nullptr);
+    std::string device_name_utf8(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, output_desc.DeviceName, -1,
+                        device_name_utf8.data(), needed, nullptr, nullptr);
 
-    // Get display mode to check refresh rate
+    spdlog::debug("[DXGI] Output: {} at ({}, {}) to ({}, {})",
+                  device_name_utf8,
+                  output_desc.DesktopCoordinates.left,
+                  output_desc.DesktopCoordinates.top,
+                  output_desc.DesktopCoordinates.right,
+                  output_desc.DesktopCoordinates.bottom);
+
+    width_  = static_cast<uint32_t>(
+        output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left);
+    height_ = static_cast<uint32_t>(
+        output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top);
+
+    // Query monitor refresh rate for informational logging
     DXGI_MODE_DESC mode_desc{};
-    mode_desc.Width = width_;
+    mode_desc.Width  = width_;
     mode_desc.Height = height_;
     mode_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     DXGI_MODE_DESC closest_mode{};
     hr = output_->FindClosestMatchingMode(&mode_desc, &closest_mode, nullptr);
     if (SUCCEEDED(hr)) {
-        double refresh_rate = static_cast<double>(closest_mode.RefreshRate.Numerator) / closest_mode.RefreshRate.Denominator;
+        double refresh_rate = static_cast<double>(closest_mode.RefreshRate.Numerator)
+                            / closest_mode.RefreshRate.Denominator;
         spdlog::info("[DXGI] Monitor refresh rate: {:.2f} Hz", refresh_rate);
     }
 
-    // Use DuplicateOutput1 with explicit format (BGRA)
+    // DuplicateOutput1 with explicit BGRA format — avoids format surprises from
+    // the older DuplicateOutput which returns whatever the driver selects.
     DXGI_FORMAT formats[] = { DXGI_FORMAT_B8G8R8A8_UNORM };
     hr = output_->DuplicateOutput1(device_.Get(), 0, 1, formats, &duplication_);
 
@@ -168,9 +182,9 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
         if (hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) {
             spdlog::error("[DXGI] Too many applications using desktop duplication (max 1-2)");
         } else if (hr == DXGI_ERROR_UNSUPPORTED) {
-            spdlog::error("[DXGI] Desktop duplication not supported (are you in fullscreen exclusive mode?)");
+            spdlog::error("[DXGI] Desktop duplication not supported (fullscreen exclusive mode?)");
         } else if (hr == E_ACCESSDENIED) {
-            spdlog::error("[DXGI] Access denied - another application is already capturing");
+            spdlog::error("[DXGI] Access denied — another application is already capturing");
         }
         return false;
     }
@@ -184,7 +198,6 @@ Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
         return Result<CaptureFrame>::error("Duplication not initialized");
     }
 
-    // Release previous frame if still held
     if (frame_acquired_) {
         release_frame();
     }
@@ -200,13 +213,11 @@ Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
         &resource
     );
 
-    // Handle timeout (no new frame)
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         stats_.frames_skipped++;
-        return Result<CaptureFrame>::error("timeout");  // Not an error, screen didn't change
+        return Result<CaptureFrame>::error("timeout");
     }
 
-    // Handle access lost (resolution change, mode switch, etc.)
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         spdlog::warn("[DXGI] Access lost, attempting to recreate duplication...");
         recreate_duplication();
@@ -214,15 +225,16 @@ Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
     }
 
     if (FAILED(hr)) {
-        return Result<CaptureFrame>::error(std::format("AcquireNextFrame failed: 0x{:08X}", static_cast<uint32_t>(hr)));
+        return Result<CaptureFrame>::error(
+            std::format("AcquireNextFrame failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
-    // Get texture from resource
     ComPtr<ID3D11Texture2D> texture;
     hr = resource.As(&texture);
     if (FAILED(hr)) {
         duplication_->ReleaseFrame();
-        return Result<CaptureFrame>::error(std::format("Failed to get texture: 0x{:08X}", static_cast<uint32_t>(hr)));
+        return Result<CaptureFrame>::error(
+            std::format("QueryInterface for ID3D11Texture2D failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     frame_acquired_ = true;
@@ -230,15 +242,15 @@ Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
     // Update statistics
     auto elapsed = std::chrono::steady_clock::now() - start;
     double capture_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-
     stats_.frames_captured++;
-    stats_.avg_capture_ms = (stats_.avg_capture_ms * (stats_.frames_captured - 1) + capture_ms) / stats_.frames_captured;
+    stats_.avg_capture_ms =
+        (stats_.avg_capture_ms * (stats_.frames_captured - 1) + capture_ms) / stats_.frames_captured;
     if (capture_ms < stats_.min_capture_ms) stats_.min_capture_ms = capture_ms;
     if (capture_ms > stats_.max_capture_ms) stats_.max_capture_ms = capture_ms;
 
-    // Calculate timestamp
     auto now = std::chrono::steady_clock::now();
-    uint64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time_).count();
+    uint64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - start_time_).count();
 
     CaptureFrame frame;
     frame.texture = texture;
@@ -274,18 +286,17 @@ bool DXGICapture::recreate_duplication() {
     return false;
 }
 
-// Static utility function: Save texture to BMP using WIC
+// Static utility — raw D3D11 pointers are passed in (caller owns them).
 bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
-                                      ID3D11DeviceContext* context,
-                                      ID3D11Texture2D* texture,
-                                      const std::wstring& filepath) {
+                                       ID3D11DeviceContext* context,
+                                       ID3D11Texture2D* texture,
+                                       const std::wstring& filepath) {
     HRESULT hr;
 
-    // Get texture description
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
 
-    // Create staging texture (CPU-readable)
+    // Staging texture for CPU read-back
     D3D11_TEXTURE2D_DESC staging_desc = desc;
     staging_desc.Usage = D3D11_USAGE_STAGING;
     staging_desc.BindFlags = 0;
@@ -299,10 +310,8 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
         return false;
     }
 
-    // Copy GPU texture to staging (GPU -> CPU)
     context->CopyResource(staging_texture.Get(), texture);
 
-    // Map staging texture
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = context->Map(staging_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
@@ -310,79 +319,75 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
         return false;
     }
 
-    // Create WIC factory
     ComPtr<IWICImagingFactory> wic_factory;
-    hr = CoCreateInstance(
-        CLSID_WICImagingFactory,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&wic_factory)
-    );
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&wic_factory));
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to create WIC factory: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Create output stream
     ComPtr<IWICStream> stream;
     hr = wic_factory->CreateStream(&stream);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to create WIC stream: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     hr = stream->InitializeFromFilename(filepath.c_str(), GENERIC_WRITE);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
-        spdlog::error("[WIC] Failed to create output file: 0x{:08X}", static_cast<uint32_t>(hr));
+        spdlog::error("[WIC] Failed to open output file: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Create BMP encoder
     ComPtr<IWICBitmapEncoder> encoder;
     hr = wic_factory->CreateEncoder(GUID_ContainerFormatBmp, nullptr, &encoder);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to create BMP encoder: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to initialize encoder: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Create frame
     ComPtr<IWICBitmapFrameEncode> frame;
     hr = encoder->CreateNewFrame(&frame, nullptr);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to create frame: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     hr = frame->Initialize(nullptr);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to initialize frame: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Set frame size
     hr = frame->SetSize(desc.Width, desc.Height);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to set frame size: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Set pixel format (BGRA)
     WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
     hr = frame->SetPixelFormat(&format);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
+        spdlog::error("[WIC] Failed to set pixel format: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
-    // Write pixels
     hr = frame->WritePixels(
         desc.Height,
         mapped.RowPitch,
@@ -397,14 +402,15 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
         return false;
     }
 
-    // Commit frame and encoder
     hr = frame->Commit();
     if (FAILED(hr)) {
+        spdlog::error("[WIC] Failed to commit frame: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
     hr = encoder->Commit();
     if (FAILED(hr)) {
+        spdlog::error("[WIC] Failed to commit encoder: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 

@@ -12,15 +12,7 @@
 #include <string>
 #include <chrono>
 
-using Microsoft::WRL::ComPtr;
-
 namespace gamestream {
-
-struct CaptureConfig {
-    uint32_t adapter_index = 0;  // 0 = first adapter, will search for AMD
-    uint32_t output_index = 0;   // 0 = primary monitor
-    bool find_amd_gpu = true;    // Automatically find AMD GPU
-};
 
 /// DXGI Desktop Duplication implementation
 class DXGICapture : public IFrameCapture {
@@ -32,37 +24,37 @@ public:
     DXGICapture(const DXGICapture&) = delete;
     DXGICapture& operator=(const DXGICapture&) = delete;
 
-    // Movable
+    // Movable (per principle 15.7)
     DXGICapture(DXGICapture&&) noexcept = default;
     DXGICapture& operator=(DXGICapture&&) noexcept = default;
 
     // IFrameCapture interface
-    VoidResult initialize(uint32_t adapter_index = 0) override;
-    Result<CaptureFrame> acquire_frame(uint64_t timeout_ms = 16) override;
+    [[nodiscard]] VoidResult initialize(uintptr_t adapter_index = 0) override;
+    [[nodiscard]] Result<CaptureFrame> acquire_frame(uint64_t timeout_ms = 16) override;
     void release_frame() override;
     void get_resolution(uint32_t& width, uint32_t& height) const override;
     bool is_initialized() const override { return duplication_ != nullptr; }
     CaptureStats get_stats() const override { return stats_; }
 
     // Additional DXGI-specific methods
-    bool initialize_with_config(const CaptureConfig& config);
-    bool recreate_duplication();
+    [[nodiscard]] bool initialize_with_config(const CaptureConfig& config);
+    [[nodiscard]] bool recreate_duplication();
 
     // Utility: Save texture to BMP file using WIC
-    static bool save_texture_to_bmp(ID3D11Device* device,
-                                    ID3D11DeviceContext* context,
-                                    ID3D11Texture2D* texture,
-                                    const std::wstring& filepath);
+    [[nodiscard]] static bool save_texture_to_bmp(ID3D11Device* device,
+                                                   ID3D11DeviceContext* context,
+                                                   ID3D11Texture2D* texture,
+                                                   const std::wstring& filepath);
 
 private:
     bool create_device(uint32_t adapter_index, bool find_amd);
     bool create_duplication(uint32_t output_index);
 
-    ComPtr<ID3D11Device> device_;
-    ComPtr<ID3D11DeviceContext> context_;
-    ComPtr<IDXGIOutputDuplication> duplication_;
-    ComPtr<IDXGIAdapter1> adapter_;
-    ComPtr<IDXGIOutput1> output_;
+    Microsoft::WRL::ComPtr<ID3D11Device> device_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+    Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication_;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter_;
+    Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
 
     uint32_t width_ = 0;
     uint32_t height_ = 0;

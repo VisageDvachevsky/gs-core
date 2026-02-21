@@ -12,9 +12,9 @@ set(CMAKE_SYSTEM_VERSION "10.0.26100.0")
 set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10")
 set(WINDOWS_SDK_VERSION "10.0.26100.0")
 
-# Find packages
-find_package(spdlog CONFIG)
-find_package(fmt CONFIG)
+# Find packages — REQUIRED: missing dependencies fail fast with a clear message
+find_package(spdlog CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 
 # AMF SDK paths
 set(AMF_SDK_DIR "C:/dev/AMF" CACHE PATH "Path to AMF SDK")
@@ -54,59 +54,64 @@ set(CAPTURE_HEADERS
     include/wgc_capture.h
 )
 
-# Source files for DXGI capture test
-set(CAPTURE_TEST_SOURCES
+# ---------------------------------------------------------------------------
+# capture_test — DXGI single-frame capture, saves BMP files
+# ---------------------------------------------------------------------------
+add_executable(capture_test
     src/capture/dxgi_capture.cpp
     tools/capture_test.cpp
     ${CAPTURE_HEADERS}
 )
+target_link_libraries(capture_test PRIVATE
+    ${WIN_LIBS}
+    spdlog::spdlog
+    fmt::fmt
+)
+target_compile_options(capture_test PRIVATE /W4 /WX /permissive-)
 
-# DXGI Capture Test executable
-add_executable(capture_test ${CAPTURE_TEST_SOURCES})
-target_link_libraries(capture_test PRIVATE ${WIN_LIBS})
-
-if(TARGET spdlog::spdlog)
-    target_link_libraries(capture_test PRIVATE spdlog::spdlog)
-endif()
-
-if(TARGET fmt::fmt)
-    target_link_libraries(capture_test PRIVATE fmt::fmt)
-endif()
-
-# 60 FPS Loop Test executable
+# ---------------------------------------------------------------------------
+# fps_loop_test — DXGI continuous 60 FPS capture loop
+# ---------------------------------------------------------------------------
 add_executable(fps_loop_test
     src/capture/dxgi_capture.cpp
     tools/fps_loop_test.cpp
     ${CAPTURE_HEADERS}
 )
-target_link_libraries(fps_loop_test PRIVATE ${WIN_LIBS})
+target_link_libraries(fps_loop_test PRIVATE
+    ${WIN_LIBS}
+    spdlog::spdlog
+    fmt::fmt
+)
+target_compile_options(fps_loop_test PRIVATE /W4 /WX /permissive-)
 
-# WGC Capture Test executable
+# ---------------------------------------------------------------------------
+# wgc_test — WGC per-window capture loop
+# ---------------------------------------------------------------------------
 add_executable(wgc_test
     src/capture/wgc_capture.cpp
     tools/wgc_test.cpp
     ${CAPTURE_HEADERS}
 )
-target_link_libraries(wgc_test PRIVATE ${WIN_LIBS} ${WINRT_LIBS})
-
-# Enable C++/WinRT for wgc_test
+target_link_libraries(wgc_test PRIVATE
+    ${WIN_LIBS}
+    ${WINRT_LIBS}
+    spdlog::spdlog
+    fmt::fmt
+)
 target_compile_options(wgc_test PRIVATE
+    /W4
+    /WX
+    /permissive-
     /await:strict
     /EHsc
-    /permissive-
 )
 
-# Set output directory
+# ---------------------------------------------------------------------------
+# Common settings
+# ---------------------------------------------------------------------------
 set_target_properties(capture_test fps_loop_test wgc_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
-
-# Enable warnings
-if(MSVC)
-    target_compile_options(capture_test PRIVATE /W4 /WX)
-    target_compile_options(fps_loop_test PRIVATE /W4 /WX)
-    target_compile_options(wgc_test PRIVATE /W4 /WX)
-endif()
 
 message(STATUS "GameStream Core - CMake Configuration")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
