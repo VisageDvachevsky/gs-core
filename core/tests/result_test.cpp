@@ -3,21 +3,28 @@
 /// Target: 100% line coverage of every executable line in result.h.
 ///
 /// Coverage map (result.h line → test that covers it):
-///   22  — SuccessFromRvalue (rvalue constructor)
-///   23  — SuccessFromLvalue (lvalue constructor)
-///   26–30 — ErrorFactory (error() static method, all 4 lines)
-///   33  — HasValueReturns{True,False}OnSuccess/Error
-///   34  — BoolOperator{True,False}On{Success,Error}
-///   37–40 — ValueLvalueRefReturnsReference (success path) +
-///            LvalueValueOnErrorState (death test for assert)
-///   41–44 — ValueConstLvalueRef + ConstLvalueValueOnErrorState
-///   45–48 — ValueRvalueMovesOut + RvalueValueOnErrorState
-///   51  — ErrorMessageAccessor
-///   62  — DefaultConstructorIsSuccess
-///   65–68 — VoidResult::ErrorFactory
-///   72  — VoidResult::HasValueOn{Success,Error}
-///   73  — VoidResult::BoolOn{Success,Error}
-///   76  — VoidResult::ErrorAccessorReturnsMessage
+///   detail::Ok<T> { T value }  — SuccessFromRvalue, SuccessFromLvalue
+///   detail::Err { string msg } — ErrorFactory, EmptyErrorString
+///   Result(T&&)                — SuccessFromRvalue
+///   Result(const T&)           — SuccessFromLvalue
+///   error() factory            — ErrorFactory, EmptyErrorString, Copy*, Move*
+///   has_value() true           — HasValueReturnsTrueOnSuccess
+///   has_value() false          — HasValueReturnsFalseOnError
+///   operator bool true         — BoolOperatorTrueOnSuccess
+///   operator bool false        — BoolOperatorFalseOnError
+///   value() &                  — ValueLvalueRefReturnsReference
+///   assert in value() &        — LvalueValueOnErrorState (death), covered by success path
+///   value() const &            — ValueConstLvalueRef
+///   assert in value() const &  — ConstLvalueValueOnErrorState (death)
+///   value() &&                 — ValueRvalueMovesOut
+///   assert in value() &&       — RvalueValueOnErrorState (death)
+///   error() const accessor     — ErrorMessageAccessor, EmptyErrorString, ErrorThrowsOnSuccess
+///   ErrorConstructTag, ctor    — every error() factory call
+///   VoidResult()               — DefaultConstructorIsSuccess
+///   VoidResult::error()        — VoidResult::ErrorFactory, EmptyVoidErrorString
+///   VoidResult::has_value()    — HasValueOn{Success,Error}
+///   VoidResult::operator bool  — BoolOn{True,False}
+///   VoidResult::error() const  — ErrorAccessorReturnsMessage
 
 #include "result.h"
 
@@ -25,21 +32,22 @@
 
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace gamestream;
 
 // ===========================================================================
-// Result<int> — tests with a trivial value type
+// Result<int> — basic behaviour with a trivial value type
 // ===========================================================================
 
-// line 22: Result(T&& value) : data_(std::move(value)) {}
+// detail::Ok<T> rvalue branch; Result(T&&)
 TEST(ResultTest, SuccessFromRvalue) {
     Result<int> r(42);
     EXPECT_TRUE(r.has_value());
     EXPECT_EQ(r.value(), 42);
 }
 
-// line 23: Result(const T& value) : data_(value) {}
+// detail::Ok<T> lvalue branch; Result(const T&)
 TEST(ResultTest, SuccessFromLvalue) {
     const int x = 100;
     Result<int> r(x);
@@ -47,90 +55,156 @@ TEST(ResultTest, SuccessFromLvalue) {
     EXPECT_EQ(r.value(), 100);
 }
 
-// lines 26–30: static Result error(std::string msg) { ... }
+// error() factory + ErrorConstructTag private ctor + detail::Err
 TEST(ResultTest, ErrorFactory) {
     auto r = Result<int>::error("something failed");
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), "something failed");
 }
 
-// line 33: bool has_value() const — true branch
+// Edge case: empty error string is a valid error state
+TEST(ResultTest, EmptyErrorString) {
+    auto r = Result<int>::error("");
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), "");
+}
+
+// has_value() — true branch
 TEST(ResultTest, HasValueReturnsTrueOnSuccess) {
     Result<int> r(1);
     EXPECT_TRUE(r.has_value());
 }
 
-// line 33: bool has_value() const — false branch
+// has_value() — false branch
 TEST(ResultTest, HasValueReturnsFalseOnError) {
     auto r = Result<int>::error("err");
     EXPECT_FALSE(r.has_value());
 }
 
-// line 34: explicit operator bool() const — true branch
+// operator bool — true branch
 TEST(ResultTest, BoolOperatorTrueOnSuccess) {
     Result<int> r(7);
     EXPECT_TRUE(static_cast<bool>(r));
 }
 
-// line 34: explicit operator bool() const — false branch
+// operator bool — false branch
 TEST(ResultTest, BoolOperatorFalseOnError) {
     auto r = Result<int>::error("x");
     EXPECT_FALSE(static_cast<bool>(r));
 }
 
-// lines 37–40: T& value() & — lvalue reference overload, success path
+// value() & — lvalue reference; mutation propagates back
 TEST(ResultTest, ValueLvalueRefReturnsReference) {
     Result<int> r(55);
     int& ref = r.value();
     EXPECT_EQ(ref, 55);
-    ref = 99;                   // Mutate through the reference
-    EXPECT_EQ(r.value(), 99);  // Confirm the mutation
+    ref = 99;
+    EXPECT_EQ(r.value(), 99);
 }
 
-// lines 41–44: const T& value() const & — const lvalue reference overload
+// value() const & — const lvalue reference
 TEST(ResultTest, ValueConstLvalueRef) {
     const Result<int> r(77);
     const int& ref = r.value();
     EXPECT_EQ(ref, 77);
 }
 
-// lines 45–48: T&& value() && — rvalue reference overload (moves value out)
+// value() && — rvalue overload moves value out of Result
 TEST(ResultTest, ValueRvalueMovesOut) {
-    Result<std::string> r(std::string("hello"));
-    std::string moved = std::move(r).value();
-    EXPECT_EQ(moved, "hello");
+    Result<std::vector<int>> r(std::vector<int>{1, 2, 3});
+    std::vector<int> moved = std::move(r).value();
+    EXPECT_EQ(moved, (std::vector<int>{1, 2, 3}));
 }
 
-// line 51: const std::string& error() const
+// error() accessor
 TEST(ResultTest, ErrorMessageAccessor) {
     auto r = Result<int>::error("specific error msg");
     const std::string& msg = r.error();
     EXPECT_EQ(msg, "specific error msg");
 }
 
-// ---------------------------------------------------------------------------
-// Result<std::string> — ensures template works with non-trivial types
-// ---------------------------------------------------------------------------
+// error() on success state — throws std::bad_variant_access
+TEST(ResultTest, ErrorThrowsOnSuccessState) {
+    Result<int> r(42);
+    EXPECT_THROW([[maybe_unused]] const auto& e = r.error(), std::bad_variant_access);
+}
 
-TEST(ResultTest, StringValueRoundTrip) {
+// ===========================================================================
+// Result<int> — copy and move semantics
+// ===========================================================================
+
+// Copy constructor preserves value
+TEST(ResultTest, CopyConstructorPreservesSuccessValue) {
+    Result<int> r1(123);
+    Result<int> r2 = r1;               // copy
+    EXPECT_TRUE(r2.has_value());
+    EXPECT_EQ(r2.value(), 123);
+    EXPECT_EQ(r1.value(), 123);        // original unchanged
+}
+
+// Copy constructor preserves error
+TEST(ResultTest, CopyConstructorPreservesError) {
+    auto r1 = Result<int>::error("copy me");
+    Result<int> r2 = r1;               // copy
+    EXPECT_FALSE(r2.has_value());
+    EXPECT_EQ(r2.error(), "copy me");
+    EXPECT_EQ(r1.error(), "copy me");  // original unchanged
+}
+
+// Copy assignment
+TEST(ResultTest, CopyAssignmentFromSuccess) {
+    Result<int> r1(42);
+    auto r2 = Result<int>::error("old");
+    r2 = r1;                           // copy-assign success over error
+    EXPECT_TRUE(r2.has_value());
+    EXPECT_EQ(r2.value(), 42);
+}
+
+// Move constructor
+TEST(ResultTest, MoveConstructorSuccess) {
+    Result<int> r1(88);
+    Result<int> r2 = std::move(r1);
+    EXPECT_TRUE(r2.has_value());
+    EXPECT_EQ(r2.value(), 88);
+}
+
+// Move constructor for error
+TEST(ResultTest, MoveConstructorError) {
+    auto r1 = Result<int>::error("move me");
+    Result<int> r2 = std::move(r1);
+    EXPECT_FALSE(r2.has_value());
+    EXPECT_EQ(r2.error(), "move me");
+}
+
+// ===========================================================================
+// Result<std::string> — T = std::string must work (was broken before Ok<T> fix)
+// ===========================================================================
+
+TEST(ResultTest, StringTypeSuccessRoundTrip) {
     Result<std::string> r(std::string("world"));
     EXPECT_TRUE(r.has_value());
     EXPECT_EQ(r.value(), "world");
 }
 
-TEST(ResultTest, StringErrorFactory) {
+TEST(ResultTest, StringTypeErrorFactory) {
     auto r = Result<std::string>::error("string error");
     EXPECT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), "string error");
 }
 
-// ---------------------------------------------------------------------------
-// Death tests — assert fires when value() is called on an error Result.
-// In Release builds (NDEBUG defined), EXPECT_DEBUG_DEATH is a no-op —
-// lines 38/42/46 are still covered by the success-path tests above.
-// ---------------------------------------------------------------------------
+// value() && with std::string — the value is moved out
+TEST(ResultTest, StringTypeValueRvalueMovesOut) {
+    Result<std::string> r(std::string("hello"));
+    std::string moved = std::move(r).value();
+    EXPECT_EQ(moved, "hello");
+}
 
-// line 38: assert(has_value()) in T& value() &
+// ===========================================================================
+// Death tests — assert fires when value() called on error state.
+// In Release builds (NDEBUG defined) EXPECT_DEBUG_DEATH is a no-op;
+// the assert lines are still covered by success-path tests above.
+// ===========================================================================
+
 TEST(ResultDeathTest, LvalueValueOnErrorState) {
     EXPECT_DEBUG_DEATH(
         {
@@ -140,7 +214,6 @@ TEST(ResultDeathTest, LvalueValueOnErrorState) {
         ".*");
 }
 
-// line 42: assert(has_value()) in const T& value() const &
 TEST(ResultDeathTest, ConstLvalueValueOnErrorState) {
     EXPECT_DEBUG_DEATH(
         {
@@ -150,7 +223,6 @@ TEST(ResultDeathTest, ConstLvalueValueOnErrorState) {
         ".*");
 }
 
-// line 46: assert(has_value()) in T&& value() &&
 TEST(ResultDeathTest, RvalueValueOnErrorState) {
     EXPECT_DEBUG_DEATH(
         {
@@ -160,17 +232,17 @@ TEST(ResultDeathTest, RvalueValueOnErrorState) {
 }
 
 // ===========================================================================
-// VoidResult — tests for the void specialization
+// VoidResult
 // ===========================================================================
 
-// line 62: VoidResult() : error_{} {}
+// VoidResult() default ctor
 TEST(VoidResultTest, DefaultConstructorIsSuccess) {
     VoidResult r;
     EXPECT_TRUE(r.has_value());
     EXPECT_TRUE(static_cast<bool>(r));
 }
 
-// lines 65–68: static VoidResult error(std::string msg) { ... }
+// VoidResult::error() factory
 TEST(VoidResultTest, ErrorFactory) {
     auto r = VoidResult::error("void failed");
     EXPECT_FALSE(r.has_value());
@@ -178,19 +250,26 @@ TEST(VoidResultTest, ErrorFactory) {
     EXPECT_EQ(r.error(), "void failed");
 }
 
-// line 72: bool has_value() const — true branch
+// Edge case: empty error string
+TEST(VoidResultTest, EmptyErrorString) {
+    auto r = VoidResult::error("");
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), "");
+}
+
+// has_value() — true branch
 TEST(VoidResultTest, HasValueOnSuccess) {
     VoidResult r;
     EXPECT_TRUE(r.has_value());
 }
 
-// line 72: bool has_value() const — false branch
+// has_value() — false branch
 TEST(VoidResultTest, HasValueOnError) {
     auto r = VoidResult::error("err");
     EXPECT_FALSE(r.has_value());
 }
 
-// line 73: explicit operator bool() const — true branch
+// operator bool — true branch
 TEST(VoidResultTest, BoolTrueOnSuccess) {
     VoidResult r;
     if (!r) {
@@ -198,7 +277,7 @@ TEST(VoidResultTest, BoolTrueOnSuccess) {
     }
 }
 
-// line 73: explicit operator bool() const — false branch
+// operator bool — false branch
 TEST(VoidResultTest, BoolFalseOnError) {
     auto r = VoidResult::error("fail");
     if (r) {
@@ -206,8 +285,22 @@ TEST(VoidResultTest, BoolFalseOnError) {
     }
 }
 
-// line 76: const std::string& error() const { return *error_; }
+// error() accessor
 TEST(VoidResultTest, ErrorAccessorReturnsMessage) {
     auto r = VoidResult::error("specific error");
     EXPECT_EQ(r.error(), "specific error");
+}
+
+// Copy semantics of VoidResult
+TEST(VoidResultTest, CopySuccessPreservesState) {
+    VoidResult r1;
+    VoidResult r2 = r1;
+    EXPECT_TRUE(r2.has_value());
+}
+
+TEST(VoidResultTest, CopyErrorPreservesMessage) {
+    auto r1 = VoidResult::error("copy");
+    VoidResult r2 = r1;
+    EXPECT_FALSE(r2.has_value());
+    EXPECT_EQ(r2.error(), "copy");
 }

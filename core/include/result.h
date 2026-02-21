@@ -7,7 +7,21 @@
 
 namespace gamestream {
 
-/// Lightweight Result type for error handling without exceptions (C++20 compatible)
+/// Internal wrapper types for Result<T>.
+/// Wrapping T in Ok<T> ensures the variant always holds distinct alternatives,
+/// which makes Result<std::string> and Result<any T> well-formed.
+namespace detail {
+
+template<typename T>
+struct Ok { T value; };
+
+struct Err { std::string message; };
+
+} // namespace detail
+
+/// Lightweight Result type for error handling without exceptions (C++20 compatible).
+/// Works correctly for any T, including T = std::string and non-default-constructible T.
+///
 /// Usage:
 ///   Result<Texture> texture = capture.acquire_frame();
 ///   if (!texture) {
@@ -18,41 +32,41 @@ namespace gamestream {
 template<typename T>
 class Result {
 public:
-    // Success constructor
-    Result(T&& value) : data_(std::move(value)) {}
-    Result(const T& value) : data_(value) {}
+    // Success constructors
+    Result(T&& value) : data_(detail::Ok<T>{std::move(value)}) {}
+    Result(const T& value) : data_(detail::Ok<T>{value}) {}
 
-    // Error constructor
+    // Error factory — never default-constructs T
     static Result error(std::string msg) {
-        Result r;
-        r.data_ = std::move(msg);
-        return r;
+        return Result(ErrorConstructTag{}, std::move(msg));
     }
 
     // Check if result is success
-    bool has_value() const { return std::holds_alternative<T>(data_); }
+    bool has_value() const { return std::holds_alternative<detail::Ok<T>>(data_); }
     explicit operator bool() const { return has_value(); }
 
-    // Get value (undefined if error)
+    // Get value (assert fires on error state)
     T& value() & {
         assert(has_value() && "Result::value() called on error state");
-        return std::get<T>(data_);
+        return std::get<detail::Ok<T>>(data_).value;
     }
     const T& value() const & {
         assert(has_value() && "Result::value() called on error state");
-        return std::get<T>(data_);
+        return std::get<detail::Ok<T>>(data_).value;
     }
     T&& value() && {
         assert(has_value() && "Result::value() called on error state");
-        return std::move(std::get<T>(data_));
+        return std::move(std::get<detail::Ok<T>>(data_).value);
     }
 
-    // Get error message (undefined if success)
-    const std::string& error() const { return std::get<std::string>(data_); }
+    // Get error message — throws std::bad_variant_access if called on success state
+    const std::string& error() const { return std::get<detail::Err>(data_).message; }
 
 private:
-    Result() = default;  // Private default constructor for error()
-    std::variant<T, std::string> data_;
+    struct ErrorConstructTag {};
+    Result(ErrorConstructTag, std::string msg) : data_(detail::Err{std::move(msg)}) {}
+
+    std::variant<detail::Ok<T>, detail::Err> data_;
 };
 
 /// Result<void> specialization for operations that don't return a value
@@ -72,7 +86,7 @@ public:
     bool has_value() const { return !error_.has_value(); }
     explicit operator bool() const { return has_value(); }
 
-    // Get error message (undefined if success)
+    // Get error message — undefined behaviour on success state; always check first
     const std::string& error() const { return *error_; }
 
 private:
