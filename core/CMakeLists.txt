@@ -84,6 +84,14 @@ set(ENCODER_HEADERS
     include/util/ring_buffer.h
 )
 
+# WebRTC abstraction headers (no libwebrtc dependency — interfaces + types only)
+set(WEBRTC_ABSTRACT_HEADERS
+    include/webrtc_types.h
+    include/iwebrtc_observer.h
+    include/iwebrtc_host.h
+    include/webrtc_host.h
+)
+
 # Capture sources (shared between several targets)
 set(CAPTURE_SOURCES
     src/capture/dxgi_capture.cpp
@@ -218,7 +226,8 @@ target_compile_options(wgc_encode_test PRIVATE
 # ---------------------------------------------------------------------------
 # unit_tests — GoogleTest suite: result.h, capture_types.h, encoder types,
 #              IEncoder contract, RingBuffer (all edge cases + SPSC stress),
-#              AMFEncoder / DXGICapture / WGCCapture precondition checks
+#              AMFEncoder / DXGICapture / WGCCapture precondition checks,
+#              Stage 3: WebRTC abstraction layer (no libwebrtc dependency)
 # ---------------------------------------------------------------------------
 add_executable(unit_tests
     tests/result_test.cpp
@@ -229,11 +238,14 @@ add_executable(unit_tests
     tests/amf_encoder_unit_test.cpp
     tests/dxgi_capture_unit_test.cpp
     tests/wgc_capture_unit_test.cpp
+    tests/webrtc_types_test.cpp
+    tests/iwebrtc_host_test.cpp
     ${CAPTURE_SOURCES}
     src/capture/wgc_capture.cpp
     ${ENCODER_SOURCES}
     ${CAPTURE_HEADERS}
     ${ENCODER_HEADERS}
+    ${WEBRTC_ABSTRACT_HEADERS}
 )
 target_link_libraries(unit_tests PRIVATE
     GTest::gtest_main
