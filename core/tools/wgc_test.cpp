@@ -11,7 +11,7 @@ using namespace std::chrono;
 
 std::atomic<bool> running{true};
 
-void signal_handler(int signal) {
+void signal_handler(int /*signal*/) {
     running = false;
 }
 

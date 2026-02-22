@@ -16,6 +16,7 @@
 
 // WinRT projections
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
@@ -59,7 +60,7 @@ public:
     // State
     bool is_initialized_ = false;
     CaptureStats stats_{};
-    winrt::Windows::Foundation::SizeInt32 current_size_{};
+    winrt::Windows::Graphics::SizeInt32 current_size_{};
 
     // Frame-ready signalling (condition variable pattern)
     std::mutex frame_mutex_;
@@ -68,7 +69,7 @@ public:
 
     // Resize detection — written under frame_mutex_, read under frame_mutex_
     bool resize_pending_ = false;
-    winrt::Windows::Foundation::SizeInt32 pending_size_{};
+    winrt::Windows::Graphics::SizeInt32 pending_size_{};
 
     // Initialization helpers
     bool init_d3d11_device();
@@ -78,7 +79,7 @@ public:
     bool start_capture_session();
 
     // Resize — called from acquire_frame(), never from the callback
-    void recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 new_size);
+    void recreate_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size);
 
     // Single FrameArrived implementation shared by init_frame_pool and recreate_frame_pool.
     // Called from the WGC compositor thread.
@@ -139,7 +140,7 @@ Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
     // Read resize state under the mutex, then execute the resize outside it to avoid
     // holding the lock during frame pool Close/Create (which fires its own callbacks).
     bool needs_resize = false;
-    winrt::Windows::Foundation::SizeInt32 new_pool_size{};
+    winrt::Windows::Graphics::SizeInt32 new_pool_size{};
     {
         std::unique_lock lock(impl_->frame_mutex_);
         if (impl_->resize_pending_) {
@@ -412,7 +413,7 @@ void WGCCaptureImpl::on_frame_arrived(wgc::Direct3D11CaptureFramePool const& sen
 // a re-entrancy loop.  The resize flag and new size are read under frame_mutex_
 // by acquire_frame() before this call, so no further locking is needed here.
 // ---------------------------------------------------------------------------
-void WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Foundation::SizeInt32 new_size) {
+void WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size) {
     // Close old session and pool (blocks until pending callbacks finish)
     if (capture_session_) {
         capture_session_.Close();

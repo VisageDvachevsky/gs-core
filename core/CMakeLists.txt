@@ -192,6 +192,29 @@ target_link_libraries(amf_pipeline_test PRIVATE
 target_compile_options(amf_pipeline_test PRIVATE /W4 /WX /permissive-)
 
 # ---------------------------------------------------------------------------
+# wgc_encode_test — per-window WGC capture + AMF H.264 encode
+# ---------------------------------------------------------------------------
+add_executable(wgc_encode_test
+    src/capture/wgc_capture.cpp
+    ${ENCODER_SOURCES}
+    tools/wgc_encode_test.cpp
+    ${CAPTURE_HEADERS}
+    ${ENCODER_HEADERS}
+)
+target_link_libraries(wgc_encode_test PRIVATE
+    ${WIN_LIBS}
+    ${WINRT_LIBS}
+    spdlog::spdlog
+)
+target_compile_options(wgc_encode_test PRIVATE
+    /W4
+    /WX
+    /permissive-
+    /await:strict
+    /EHsc
+)
+
+# ---------------------------------------------------------------------------
 # unit_tests — GoogleTest suite: result.h, capture_types.h, encoder types,
 #              IEncoder contract, RingBuffer (all edge cases + SPSC stress)
 # ---------------------------------------------------------------------------
@@ -220,6 +243,7 @@ add_test(NAME GameStreamUnitTests COMMAND unit_tests)
 set_target_properties(
     capture_test fps_loop_test wgc_test
     amf_init_test amf_encode_test amf_pipeline_test
+    wgc_encode_test
     unit_tests
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
