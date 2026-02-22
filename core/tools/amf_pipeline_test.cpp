@@ -27,8 +27,16 @@
 #include <string>
 #include <thread>
 
+#include <windows.h>
+
 using namespace gamestream;
 using namespace std::chrono;
+
+static constexpr uint32_t  kTargetFps        = 60;
+static constexpr uint32_t  kDefaultBitrate   = 15'000'000;  // 15 Mbps
+static constexpr uint32_t  kDefaultFrameCount = 300;        // ~5 s at 60 FPS
+static constexpr uint64_t  kAcquireTimeoutMs = 33;          // ~30 FPS — allow frame skip
+static constexpr double    kEncodeTargetMs   = 6.0;         // latency budget target
 
 static void setup_logging() {
     spdlog::set_level(spdlog::level::info);
@@ -46,6 +54,8 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
                               const std::string& output_path,
                               std::atomic<uint64_t>& total_bytes_written)
 {
+    SetThreadDescription(GetCurrentThread(), L"GameStream Pipeline Writer");
+
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
         spdlog::error("[writer] Cannot open {}", output_path);
@@ -114,7 +124,7 @@ static int encode_loop(DXGICapture& capture, AMFEncoder& encoder,
         // ------------------------------------------------------------------
         auto t0 = steady_clock::now();
 
-        auto capture_result = capture.acquire_frame(33);
+        auto capture_result = capture.acquire_frame(kAcquireTimeoutMs);
         if (!capture_result) {
             spdlog::debug("Frame {}: capture timeout, skipping", i);
             continue;
@@ -197,10 +207,10 @@ static int encode_loop(DXGICapture& capture, AMFEncoder& encoder,
                  avg_enc, min_encode_ms, max_encode_ms);
     spdlog::info("    Total   avg:  {:.2f} ms", avg_tot);
 
-    if (avg_enc > 6.0) {
-        spdlog::warn("Encode latency {:.2f} ms exceeds 6 ms target", avg_enc);
+    if (avg_enc > kEncodeTargetMs) {
+        spdlog::warn("Encode latency {:.2f} ms exceeds {:.0f} ms target", avg_enc, kEncodeTargetMs);
     } else {
-        spdlog::info("Latency target MET: encode avg {:.2f} ms < 6 ms", avg_enc);
+        spdlog::info("Latency target MET: encode avg {:.2f} ms < {:.0f} ms", avg_enc, kEncodeTargetMs);
     }
 
     return EXIT_SUCCESS;
@@ -213,8 +223,10 @@ static int encode_loop(DXGICapture& capture, AMFEncoder& encoder,
 int main(int argc, char* argv[]) {
     setup_logging();
 
-    const uint32_t frame_count = (argc > 1) ? static_cast<uint32_t>(std::stoul(argv[1])) : 300;
+    const uint32_t frame_count = (argc > 1) ? static_cast<uint32_t>(std::stoul(argv[1])) : kDefaultFrameCount;
     spdlog::info("=== AMF Pipeline Test: {} frames ===", frame_count);
+
+    SetThreadDescription(GetCurrentThread(), L"GameStream Encode");
 
     // -----------------------------------------------------------------------
     // Step 1: DXGI capture
@@ -239,8 +251,8 @@ int main(int argc, char* argv[]) {
     EncoderConfig cfg;
     cfg.width       = width;
     cfg.height      = height;
-    cfg.fps         = 60;
-    cfg.bitrate_bps = 15'000'000;
+    cfg.fps         = kTargetFps;
+    cfg.bitrate_bps = kDefaultBitrate;
 
     if (auto r = encoder.initialize(device, cfg); !r) {
         spdlog::error("AMF init failed: {}", r.error());
@@ -256,20 +268,24 @@ int main(int argc, char* argv[]) {
 
     const std::string output_path = "stream_pipeline.h264";
 
-    std::thread writer(writer_thread_fn,
-                       std::ref(write_queue),
-                       std::ref(encode_done),
-                       std::cref(output_path),
-                       std::ref(total_bytes));
+    int result = EXIT_FAILURE;
+    {
+        // jthread RAII-joins on destruction, so the writer is always joined even
+        // if an exception propagates — unlike std::thread which would std::terminate.
+        std::jthread writer([&]() {
+            writer_thread_fn(write_queue, encode_done, output_path, total_bytes);
+        });
 
-    // -----------------------------------------------------------------------
-    // Step 4: Encode loop (on the calling thread)
-    // -----------------------------------------------------------------------
-    const int result = encode_loop(capture, encoder, write_queue, frame_count);
+        // -----------------------------------------------------------------------
+        // Step 4: Encode loop (on the calling thread)
+        // -----------------------------------------------------------------------
+        result = encode_loop(capture, encoder, write_queue, frame_count);
 
-    // Signal writer thread to finish and wait
-    encode_done.store(true, std::memory_order_release);
-    writer.join();
+        // Signal writer to drain remaining frames, then let the jthread join
+        // automatically when the block exits.
+        encode_done.store(true, std::memory_order_release);
+    }
+    // writer has joined here — total_bytes is now fully written
 
     spdlog::info("Output: {} ({} bytes)", output_path, total_bytes.load());
 

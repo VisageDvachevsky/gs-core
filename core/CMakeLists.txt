@@ -216,7 +216,8 @@ target_compile_options(wgc_encode_test PRIVATE
 
 # ---------------------------------------------------------------------------
 # unit_tests — GoogleTest suite: result.h, capture_types.h, encoder types,
-#              IEncoder contract, RingBuffer (all edge cases + SPSC stress)
+#              IEncoder contract, RingBuffer (all edge cases + SPSC stress),
+#              AMFEncoder / DXGICapture / WGCCapture precondition checks
 # ---------------------------------------------------------------------------
 add_executable(unit_tests
     tests/result_test.cpp
@@ -224,16 +225,29 @@ add_executable(unit_tests
     tests/encoder_types_test.cpp
     tests/iencoder_test.cpp
     tests/util/ring_buffer_test.cpp
+    tests/amf_encoder_unit_test.cpp
+    tests/dxgi_capture_unit_test.cpp
+    tests/wgc_capture_unit_test.cpp
+    ${CAPTURE_SOURCES}
+    src/capture/wgc_capture.cpp
+    ${ENCODER_SOURCES}
     ${CAPTURE_HEADERS}
     ${ENCODER_HEADERS}
 )
 target_link_libraries(unit_tests PRIVATE
     GTest::gtest_main
     GTest::gmock
-    d3d11.lib
-    dxgi.lib
+    ${WIN_LIBS}
+    ${WINRT_LIBS}
+    spdlog::spdlog
 )
-target_compile_options(unit_tests PRIVATE /W4 /WX /permissive-)
+target_compile_options(unit_tests PRIVATE
+    /W4
+    /WX
+    /permissive-
+    /EHsc
+    /await:strict
+)
 
 add_test(NAME GameStreamUnitTests COMMAND unit_tests)
 

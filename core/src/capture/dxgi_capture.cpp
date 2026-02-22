@@ -19,29 +19,23 @@ VoidResult DXGICapture::initialize(uintptr_t adapter_index) {
     // adapter_index fits comfortably in uint32_t; cast is safe for any realistic index value.
     config.adapter_index = static_cast<uint32_t>(adapter_index);
     config.find_amd_gpu = true;
-
-    if (!initialize_with_config(config)) {
-        return VoidResult::error("Failed to initialize DXGI capture");
-    }
-    return {};
+    return initialize_with_config(config);  // propagate VoidResult directly
 }
 
-bool DXGICapture::initialize_with_config(const CaptureConfig& config) {
+VoidResult DXGICapture::initialize_with_config(const CaptureConfig& config) {
     config_ = config;
     start_time_ = std::chrono::steady_clock::now();
 
     if (!create_device(config.adapter_index, config.find_amd_gpu)) {
-        spdlog::error("[DXGI] Failed to create D3D11 device");
-        return false;
+        return VoidResult::error("Failed to create D3D11 device");
     }
 
     if (!create_duplication(config.output_index)) {
-        spdlog::error("[DXGI] Failed to create desktop duplication");
-        return false;
+        return VoidResult::error("Failed to create desktop duplication");
     }
 
     spdlog::info("[DXGI] Initialized successfully: {}x{}", width_, height_);
-    return true;
+    return {};
 }
 
 bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
@@ -224,7 +218,9 @@ Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
 
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         spdlog::warn("[DXGI] Access lost, attempting to recreate duplication...");
-        [[maybe_unused]] bool recreated = recreate_duplication();
+        if (auto r = recreate_duplication(); !r) {
+            spdlog::error("[DXGI] Recreate failed: {}", r.error());
+        }
         return Result<CaptureFrame>::error("access_lost");
     }
 
@@ -277,24 +273,23 @@ void DXGICapture::get_resolution(uint32_t& width, uint32_t& height) const {
     height = height_;
 }
 
-bool DXGICapture::recreate_duplication() {
+VoidResult DXGICapture::recreate_duplication() {
     duplication_.Reset();
     frame_acquired_ = false;
 
-    if (create_duplication(config_.output_index)) {
-        spdlog::info("[DXGI] Duplication recreated successfully");
-        return true;
+    if (!create_duplication(config_.output_index)) {
+        return VoidResult::error("Failed to recreate desktop duplication");
     }
 
-    spdlog::error("[DXGI] Failed to recreate duplication");
-    return false;
+    spdlog::info("[DXGI] Duplication recreated successfully");
+    return {};
 }
 
 // Static utility — raw D3D11 pointers are passed in (caller owns them).
-bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
-                                       ID3D11DeviceContext* context,
-                                       ID3D11Texture2D* texture,
-                                       const std::wstring& filepath) {
+VoidResult DXGICapture::save_texture_to_bmp(ID3D11Device* device,
+                                             ID3D11DeviceContext* context,
+                                             ID3D11Texture2D* texture,
+                                             const std::wstring& filepath) {
     HRESULT hr;
 
     D3D11_TEXTURE2D_DESC desc;
@@ -311,7 +306,7 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     hr = device->CreateTexture2D(&staging_desc, nullptr, &staging_texture);
     if (FAILED(hr)) {
         spdlog::error("[WIC] Failed to create staging texture: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: CreateTexture2D failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     context->CopyResource(staging_texture.Get(), texture);
@@ -320,7 +315,7 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     hr = context->Map(staging_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
         spdlog::error("[WIC] Failed to map staging texture: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: Map failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     ComPtr<IWICImagingFactory> wic_factory;
@@ -329,7 +324,7 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to create WIC factory: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: CoCreateInstance(WICImagingFactory) failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     ComPtr<IWICStream> stream;
@@ -337,14 +332,14 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to create WIC stream: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: CreateStream failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = stream->InitializeFromFilename(filepath.c_str(), GENERIC_WRITE);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to open output file: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: InitializeFromFilename failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     ComPtr<IWICBitmapEncoder> encoder;
@@ -352,14 +347,14 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to create BMP encoder: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: CreateEncoder(BMP) failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to initialize encoder: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: encoder Initialize failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     ComPtr<IWICBitmapFrameEncode> frame;
@@ -367,21 +362,21 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to create frame: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: CreateNewFrame failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = frame->Initialize(nullptr);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to initialize frame: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: frame Initialize failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = frame->SetSize(desc.Width, desc.Height);
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to set frame size: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: SetSize failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
@@ -389,7 +384,7 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
     if (FAILED(hr)) {
         context->Unmap(staging_texture.Get(), 0);
         spdlog::error("[WIC] Failed to set pixel format: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: SetPixelFormat failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = frame->WritePixels(
@@ -403,22 +398,22 @@ bool DXGICapture::save_texture_to_bmp(ID3D11Device* device,
 
     if (FAILED(hr)) {
         spdlog::error("[WIC] Failed to write pixels: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: WritePixels failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = frame->Commit();
     if (FAILED(hr)) {
         spdlog::error("[WIC] Failed to commit frame: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: frame Commit failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
     hr = encoder->Commit();
     if (FAILED(hr)) {
         spdlog::error("[WIC] Failed to commit encoder: 0x{:08X}", static_cast<uint32_t>(hr));
-        return false;
+        return VoidResult::error(std::format("WIC: encoder Commit failed: 0x{:08X}", static_cast<uint32_t>(hr)));
     }
 
-    return true;
+    return {};
 }
 
 } // namespace gamestream

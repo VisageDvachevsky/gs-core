@@ -38,14 +38,14 @@ public:
     ID3D11Device* get_device() const override { return device_.Get(); }
 
     // Additional DXGI-specific methods
-    [[nodiscard]] bool initialize_with_config(const CaptureConfig& config);
-    [[nodiscard]] bool recreate_duplication();
+    [[nodiscard]] VoidResult initialize_with_config(const CaptureConfig& config);
+    [[nodiscard]] VoidResult recreate_duplication();
 
     // Utility: Save texture to BMP file using WIC
-    [[nodiscard]] static bool save_texture_to_bmp(ID3D11Device* device,
-                                                   ID3D11DeviceContext* context,
-                                                   ID3D11Texture2D* texture,
-                                                   const std::wstring& filepath);
+    [[nodiscard]] static VoidResult save_texture_to_bmp(ID3D11Device* device,
+                                                        ID3D11DeviceContext* context,
+                                                        ID3D11Texture2D* texture,
+                                                        const std::wstring& filepath);
 
 private:
     bool create_device(uint32_t adapter_index, bool find_amd);

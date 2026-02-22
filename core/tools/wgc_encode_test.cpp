@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +30,11 @@
 
 using namespace gamestream;
 using namespace std::chrono;
+
+static constexpr uint32_t kTargetFps        = 60;
+static constexpr uint32_t kDefaultBitrate   = 15'000'000;  // 15 Mbps
+static constexpr uint32_t kDefaultDurationS = 10;
+static constexpr double   kEncodeTargetMs   = 6.0;         // latency budget target
 
 // ---------------------------------------------------------------------------
 // Window enumeration
@@ -96,6 +102,8 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
                               const std::string&           output_path,
                               std::atomic<uint64_t>&       total_bytes_written)
 {
+    SetThreadDescription(GetCurrentThread(), L"GameStream WGC Writer");
+
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
         spdlog::error("[writer] Cannot open {}", output_path);
@@ -173,12 +181,25 @@ static FrameMetrics encode_and_push(AMFEncoder&                  encoder,
     return m;
 }
 
+// Blocks until the first WGC frame arrives (up to 5 s).
+// Returns the frame on success, empty optional on timeout.
+static std::optional<CaptureFrame> wait_first_frame(WGCCapture& capture) {
+    auto cap = capture.acquire_frame(5000);
+    if (!cap) {
+        spdlog::error("No frame in 5 s: {}", cap.error());
+        return std::nullopt;
+    }
+    CaptureFrame f = cap.value();
+    capture.release_frame();
+    return f;
+}
+
 // ---------------------------------------------------------------------------
-// Encode loop — fixed 60 fps output with frame duplication.
+// Encode loop — fixed kTargetFps output with frame duplication.
 //
 // WGC delivers frames whenever screen content changes.  We tick at a fixed
-// 16.67 ms (60 fps) interval; if no new WGC frame arrived, we re-encode the
-// previous texture to keep the bitstream at exactly 60 fps.
+// 16.67 ms interval; if no new WGC frame arrived, we re-encode the previous
+// texture to keep the bitstream at exactly kTargetFps.
 // ---------------------------------------------------------------------------
 
 static int encode_loop(WGCCapture&                  capture,
@@ -186,21 +207,18 @@ static int encode_loop(WGCCapture&                  capture,
                        RingBuffer<EncodedFrame, 8>& write_queue,
                        double                       duration_sec)
 {
-    constexpr int kTargetFps    = 60;
-    const auto frame_interval   = std::chrono::nanoseconds(1'000'000'000 / kTargetFps);
-    const auto deadline         = steady_clock::now() + duration<double>(duration_sec);
+    const auto frame_interval = nanoseconds(1'000'000'000 / kTargetFps);
+    const auto deadline       = steady_clock::now() + duration<double>(duration_sec);
+    const auto start_time     = steady_clock::now();
 
     encoder.request_keyframe();
-    CaptureFrame last_frame{};
-    {   // Block until the first WGC frame arrives
-        auto cap = capture.acquire_frame(5000);
-        if (!cap) { spdlog::error("No frame in 5 s: {}", cap.error()); return EXIT_FAILURE; }
-        last_frame = cap.value();
-        capture.release_frame();
-    }
+
+    auto first = wait_first_frame(capture);
+    if (!first) return EXIT_FAILURE;
+    CaptureFrame last_frame = std::move(*first);
 
     auto     next_tick     = steady_clock::now();
-    auto     last_log_time = steady_clock::now();
+    auto     last_log_time = start_time;
     uint32_t frames_out = 0, keyframes = 0, duplicates = 0;
     double   sum_enc_ms = 0.0;
 
@@ -216,12 +234,12 @@ static int encode_loop(WGCCapture&                  capture,
         sum_enc_ms += m.enc_ms;
         ++frames_out;
 
-        // Log once per second (not per-frame — principle 7.3)
+        // Log once per second — not per-frame (principle 7.3)
         auto now = steady_clock::now();
         if (duration<double>(now - last_log_time).count() >= 1.0) {
-            const double elapsed = duration<double>(now - (deadline - duration<double>(duration_sec))).count();
             spdlog::info("[{:4.1f}s] Frames: {:4} | Dups: {:4} | Encode avg: {:.2f}ms",
-                         elapsed, frames_out, duplicates,
+                         duration<double>(now - start_time).count(),
+                         frames_out, duplicates,
                          frames_out > 0 ? sum_enc_ms / frames_out : 0.0);
             last_log_time = now;
         }
@@ -234,8 +252,10 @@ static int encode_loop(WGCCapture&                  capture,
                  frames_out, frames_out - duplicates, duplicates,
                  duration_sec, frames_out / duration_sec);
     spdlog::info("    Encode avg: {:.2f} ms", avg_enc);
-    if (avg_enc > 6.0) spdlog::warn("Encode latency exceeds 6 ms target");
-    else               spdlog::info("Latency target MET: {:.2f} ms < 6 ms", avg_enc);
+    if (avg_enc > kEncodeTargetMs)
+        spdlog::warn("Encode latency exceeds {:.0f} ms target", kEncodeTargetMs);
+    else
+        spdlog::info("Latency target MET: {:.2f} ms < {:.0f} ms", avg_enc, kEncodeTargetMs);
     return EXIT_SUCCESS;
 }
 
@@ -247,7 +267,9 @@ int main(int argc, char* argv[]) {
     spdlog::set_level(spdlog::level::info);
     spdlog::set_pattern("[%H:%M:%S.%e] [%l] %v");
 
-    const double duration_sec = (argc > 1) ? std::stod(argv[1]) : 10.0;
+    SetThreadDescription(GetCurrentThread(), L"GameStream Encode");
+
+    const double duration_sec = (argc > 1) ? std::stod(argv[1]) : kDefaultDurationS;
     spdlog::info("=== WGC Encode Test: {:.0f}s recording ===", duration_sec);
 
     const uintptr_t hwnd_value = select_window();
@@ -267,7 +289,10 @@ int main(int argc, char* argv[]) {
 
     AMFEncoder encoder;
     EncoderConfig cfg;
-    cfg.width = width; cfg.height = height; cfg.fps = 60; cfg.bitrate_bps = 15'000'000;
+    cfg.width       = width;
+    cfg.height      = height;
+    cfg.fps         = kTargetFps;
+    cfg.bitrate_bps = kDefaultBitrate;
     if (auto r = encoder.initialize(device, cfg); !r) {
         spdlog::error("AMF init failed: {}", r.error());
         return EXIT_FAILURE;
@@ -280,13 +305,20 @@ int main(int argc, char* argv[]) {
     std::atomic<bool>     encode_done{false};
     std::atomic<uint64_t> total_bytes{0};
 
-    std::thread writer(writer_thread_fn, std::ref(write_queue),
-                       std::ref(encode_done), std::cref(output_path), std::ref(total_bytes));
+    int result = EXIT_FAILURE;
+    {
+        // jthread RAII-joins on destruction, ensuring the writer always finishes
+        // cleanly even if an exception propagates — unlike std::thread.
+        std::jthread writer([&]() {
+            writer_thread_fn(write_queue, encode_done, output_path, total_bytes);
+        });
 
-    const int result = encode_loop(capture, encoder, write_queue, duration_sec);
+        result = encode_loop(capture, encoder, write_queue, duration_sec);
 
-    encode_done.store(true, std::memory_order_release);
-    writer.join();
+        encode_done.store(true, std::memory_order_release);
+        // writer joins automatically when the block exits
+    }
+    // total_bytes is fully written now
 
     spdlog::info("Output: {} ({} bytes)", output_path, total_bytes.load());
     if (result == EXIT_SUCCESS) {

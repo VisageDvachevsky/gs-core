@@ -116,46 +116,53 @@ VoidResult AMFEncoderImpl::create_encoder() {
 }
 
 VoidResult AMFEncoderImpl::configure_encoder() {
-    AMF_RESULT res;
-
-    // Macro to reduce boilerplate: set property and early-return on failure
-#define AMF_SET(prop, val)                                                          \
-    res = encoder_->SetProperty((prop), static_cast<amf_int64>(val));              \
-    if (res != AMF_OK) {                                                            \
-        return VoidResult::error(std::format(                                       \
-            "SetProperty(" #prop ") failed: 0x{:08X}", static_cast<uint32_t>(res))); \
-    }
+    // Type-safe property setter: converts any integral/enum/bool value to amf_int64
+    // and includes the AMF property name (an ASCII-range wchar_t* constant) in the
+    // error message.  Template lambda (C++20) avoids the old AMF_SET macro.
+    auto narrow_name = [](const wchar_t* w) -> std::string {
+        // AMF property name constants are ASCII-range wide strings — direct narrow is safe.
+        return {w, w + std::wcslen(w)};
+    };
+    auto set = [&]<typename V>(const wchar_t* prop, V val) -> VoidResult {
+        AMF_RESULT r = encoder_->SetProperty(prop, static_cast<amf_int64>(val));
+        if (r != AMF_OK) {
+            return VoidResult::error(std::format(
+                "SetProperty({}) failed: 0x{:08X}",
+                narrow_name(prop), static_cast<uint32_t>(r)));
+        }
+        return {};
+    };
 
     // Must be set FIRST — configures all other defaults
-    AMF_SET(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY);
+    if (auto r = set(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY); !r) return r;
 
     // H.264 Baseline profile — no CABAC, no B-frames, widest decoder support
-    AMF_SET(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_BASELINE);
+    if (auto r = set(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_BASELINE); !r) return r;
 
     // No B-frames: minimize encode latency (B-frames add 1+ frame delay)
-    AMF_SET(AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0);
+    if (auto r = set(AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0); !r) return r;
 
     // Minimum reference frames: reduces encoder buffering latency
-    AMF_SET(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 1);
+    if (auto r = set(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 1); !r) return r;
 
     // Speed preset: lower quality, much lower latency (< 6 ms target)
-    AMF_SET(AMF_VIDEO_ENCODER_QUALITY_PRESET, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
+    if (auto r = set(AMF_VIDEO_ENCODER_QUALITY_PRESET, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED); !r) return r;
 
     // Internal low-latency mode (POC mode 2)
-    AMF_SET(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
+    if (auto r = set(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true); !r) return r;
 
     // CBR: constant bitrate — predictable network load for streaming
-    AMF_SET(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+    if (auto r = set(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR); !r) return r;
 
     // Bitrate from config
-    AMF_SET(AMF_VIDEO_ENCODER_TARGET_BITRATE, config_.bitrate_bps);
+    if (auto r = set(AMF_VIDEO_ENCODER_TARGET_BITRATE, config_.bitrate_bps); !r) return r;
 
     // Baseline profile uses CAVLC (not CABAC) — required for compatibility
-    AMF_SET(AMF_VIDEO_ENCODER_CABAC_ENABLE, AMF_VIDEO_ENCODER_UNDEFINED);
+    if (auto r = set(AMF_VIDEO_ENCODER_CABAC_ENABLE, AMF_VIDEO_ENCODER_UNDEFINED); !r) return r;
 
-    // Frame rate — AMFRate requires a special setter (not amf_int64)
+    // Frame rate — AMFRate requires a different SetProperty overload (not amf_int64)
     AMFRate fps_rate = AMFConstructRate(config_.fps, 1);
-    res = encoder_->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, fps_rate);
+    AMF_RESULT res = encoder_->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, fps_rate);
     if (res != AMF_OK) {
         return VoidResult::error(std::format(
             "SetProperty(FRAMERATE) failed: 0x{:08X}", static_cast<uint32_t>(res)));
@@ -163,9 +170,7 @@ VoidResult AMFEncoderImpl::configure_encoder() {
 
     // IDR every 5 seconds: allows new viewer to start decoding without waiting too long
     const amf_int64 idr_period = static_cast<amf_int64>(config_.fps) * 5;
-    AMF_SET(AMF_VIDEO_ENCODER_IDR_PERIOD, idr_period);
-
-#undef AMF_SET
+    if (auto r = set(AMF_VIDEO_ENCODER_IDR_PERIOD, idr_period); !r) return r;
 
     // Apply configuration and allocate GPU resources
     res = encoder_->Init(
