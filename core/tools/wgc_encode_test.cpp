@@ -118,7 +118,12 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
 }
 
 // ---------------------------------------------------------------------------
-// Encode loop — runs on the calling thread for duration_sec seconds
+// Encode loop — fixed 60 fps output with frame duplication.
+//
+// WGC delivers frames whenever screen content changes.  We tick at a fixed
+// 16.67 ms (60 fps) interval; if no new WGC frame arrived since the last
+// tick, we re-encode the previous texture (duplicate frame).  This keeps
+// the output bitstream at exactly 60 fps regardless of source frame rate.
 // ---------------------------------------------------------------------------
 
 static int encode_loop(WGCCapture&                  capture,
@@ -126,34 +131,54 @@ static int encode_loop(WGCCapture&                  capture,
                        RingBuffer<EncodedFrame, 8>& write_queue,
                        double                       duration_sec)
 {
-    const auto deadline = steady_clock::now() + duration<double>(duration_sec);
+    constexpr int  kTargetFps      = 60;
+    const auto     frame_interval  = std::chrono::nanoseconds(1'000'000'000 / kTargetFps);
+    const auto     deadline        = steady_clock::now() + duration<double>(duration_sec);
 
-    uint32_t frames_ok  = 0;
+    uint32_t frames_out = 0;
     uint32_t keyframes  = 0;
-    double   sum_cap_ms = 0.0;
+    uint32_t duplicates = 0;
     double   sum_enc_ms = 0.0;
 
-    encoder.request_keyframe();  // IDR on first frame
+    // Wait for the very first WGC frame before we start the fixed-rate clock.
+    encoder.request_keyframe();
+    CaptureFrame last_frame{};
+    {
+        spdlog::debug("[encode] Waiting for first frame...");
+        auto cap = capture.acquire_frame(5000);
+        if (!cap) {
+            spdlog::error("No frame received within 5 s: {}", cap.error());
+            return EXIT_FAILURE;
+        }
+        last_frame = cap.value();
+        capture.release_frame();
+    }
+
+    auto next_tick = steady_clock::now();
 
     while (steady_clock::now() < deadline) {
-        auto t0 = steady_clock::now();
+        // Sleep until the next 60 fps slot.
+        next_tick += frame_interval;
+        std::this_thread::sleep_until(next_tick);
 
-        auto cap = capture.acquire_frame(16);  // 16 ms timeout (≥ 60 FPS)
-        if (!cap) {
-            // Timeout is normal — WGC has not produced a new frame yet
-            continue;
+        // Non-blocking check: grab the newest WGC frame if one arrived.
+        // 0 ms timeout → returns immediately regardless of frame availability.
+        auto cap    = capture.acquire_frame(0);
+        bool is_dup = true;
+        if (cap) {
+            last_frame = cap.value();
+            capture.release_frame();
+            is_dup = false;
+        } else {
+            ++duplicates;
         }
 
-        auto t1 = steady_clock::now();
-
-        CaptureFrame cf = std::move(cap.value());
-        capture.release_frame();
-
-        auto enc = encoder.encode(cf);
-        auto t2  = steady_clock::now();
+        auto t0  = steady_clock::now();
+        auto enc = encoder.encode(last_frame);
+        auto t1  = steady_clock::now();
 
         if (!enc) {
-            spdlog::warn("[encode] Frame {}: {}", frames_ok, enc.error());
+            spdlog::warn("[encode] Frame {}: {}", frames_out, enc.error());
             continue;
         }
 
@@ -163,40 +188,35 @@ static int encode_loop(WGCCapture&                  capture,
         const size_t byte_cnt = ef.data.size();
         if (is_kf) keyframes++;
 
-        // Spin-push to writer thread (writer always keeps up in practice)
         while (!write_queue.try_push(std::move(ef))) {
             std::this_thread::yield();
         }
 
-        const double cap_ms = duration<double, std::milli>(t1 - t0).count();
-        const double enc_ms = duration<double, std::milli>(t2 - t1).count();
-
-        sum_cap_ms += cap_ms;
+        const double enc_ms = duration<double, std::milli>(t1 - t0).count();
         sum_enc_ms += enc_ms;
 
-        spdlog::info("Frame {:4}: {:3s} | {:6} bytes | Capture {:.2f}ms | Encode {:.2f}ms",
-                     frames_ok,
-                     is_kf ? "IDR" : "  P",
-                     byte_cnt,
-                     cap_ms, enc_ms);
+        // Only log unique frames to avoid log spam
+        if (!is_dup) {
+            spdlog::info("Frame {:4}: {:3s} | {:6} bytes | Encode {:.2f}ms",
+                         frames_out, is_kf ? "IDR" : "  P", byte_cnt, enc_ms);
+        }
 
-        ++frames_ok;
+        ++frames_out;
     }
 
-    if (frames_ok == 0) {
+    if (frames_out == 0) {
         spdlog::error("No frames encoded");
         return EXIT_FAILURE;
     }
 
-    const double avg_cap = sum_cap_ms / frames_ok;
-    const double avg_enc = sum_enc_ms / frames_ok;
-    const double fps     = frames_ok  / duration_sec;
+    const uint32_t unique_frames = frames_out - duplicates;
+    const double   avg_enc       = sum_enc_ms / frames_out;
+    const double   fps           = frames_out / duration_sec;
 
-    spdlog::info("=== Stats: {} frames, {} keyframes, {:.1f}s ===",
-                 frames_ok, keyframes, duration_sec);
-    spdlog::info("    Capture avg: {:.2f} ms", avg_cap);
+    spdlog::info("=== Stats: {} frames out ({} unique + {} duplicated), {:.1f}s ===",
+                 frames_out, unique_frames, duplicates, duration_sec);
     spdlog::info("    Encode  avg: {:.2f} ms", avg_enc);
-    spdlog::info("    Avg FPS:     {:.1f}", fps);
+    spdlog::info("    Output FPS:  {:.1f}", fps);
 
     if (avg_enc > 6.0) {
         spdlog::warn("Encode latency {:.2f} ms exceeds 6 ms target", avg_enc);
