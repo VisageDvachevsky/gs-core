@@ -17,16 +17,9 @@ set(WINDOWS_SDK_VERSION "10.0.26100.0")
 # ---------------------------------------------------------------------------
 include(FetchContent)
 
-# fmt must be fetched before spdlog so spdlog can use it via SPDLOG_FMT_EXTERNAL
-FetchContent_Declare(fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG        11.1.4
-    GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(fmt)
-
-# spdlog — structured logging (uses the fmt we fetched above)
-set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "Use external fmt library" FORCE)
+# spdlog — structured logging (uses its bundled fmt 11.0.2; no external fmt
+# dependency to avoid API incompatibilities with fmt >= 11.1 where
+# fmt::basic_format_string was moved from base.h to xchar.h).
 FetchContent_Declare(spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
     GIT_TAG        v1.15.0
@@ -74,7 +67,7 @@ set(WINRT_LIBS
     onecore.lib
 )
 
-# Header files
+# Capture headers
 set(CAPTURE_HEADERS
     include/result.h
     include/capture_types.h
@@ -83,18 +76,35 @@ set(CAPTURE_HEADERS
     include/wgc_capture.h
 )
 
+# Encoder headers
+set(ENCODER_HEADERS
+    include/encoder_types.h
+    include/iencoder.h
+    include/amf_encoder.h
+    include/util/ring_buffer.h
+)
+
+# Capture sources (shared between several targets)
+set(CAPTURE_SOURCES
+    src/capture/dxgi_capture.cpp
+)
+
+# Encoder sources
+set(ENCODER_SOURCES
+    src/codec/amf_encoder.cpp
+)
+
 # ---------------------------------------------------------------------------
 # capture_test — DXGI single-frame capture, saves BMP files
 # ---------------------------------------------------------------------------
 add_executable(capture_test
-    src/capture/dxgi_capture.cpp
+    ${CAPTURE_SOURCES}
     tools/capture_test.cpp
     ${CAPTURE_HEADERS}
 )
 target_link_libraries(capture_test PRIVATE
     ${WIN_LIBS}
     spdlog::spdlog
-    fmt::fmt
 )
 target_compile_options(capture_test PRIVATE /W4 /WX /permissive-)
 
@@ -102,14 +112,13 @@ target_compile_options(capture_test PRIVATE /W4 /WX /permissive-)
 # fps_loop_test — DXGI continuous 60 FPS capture loop
 # ---------------------------------------------------------------------------
 add_executable(fps_loop_test
-    src/capture/dxgi_capture.cpp
+    ${CAPTURE_SOURCES}
     tools/fps_loop_test.cpp
     ${CAPTURE_HEADERS}
 )
 target_link_libraries(fps_loop_test PRIVATE
     ${WIN_LIBS}
     spdlog::spdlog
-    fmt::fmt
 )
 target_compile_options(fps_loop_test PRIVATE /W4 /WX /permissive-)
 
@@ -125,7 +134,6 @@ target_link_libraries(wgc_test PRIVATE
     ${WIN_LIBS}
     ${WINRT_LIBS}
     spdlog::spdlog
-    fmt::fmt
 )
 target_compile_options(wgc_test PRIVATE
     /W4
@@ -136,12 +144,65 @@ target_compile_options(wgc_test PRIVATE
 )
 
 # ---------------------------------------------------------------------------
-# unit_tests — GoogleTest unit tests for result.h and capture_types.h
+# amf_init_test — Day 6 smoke test: DXGI init -> AMF encoder init
+# ---------------------------------------------------------------------------
+add_executable(amf_init_test
+    ${CAPTURE_SOURCES}
+    ${ENCODER_SOURCES}
+    tools/amf_init_test.cpp
+    ${CAPTURE_HEADERS}
+    ${ENCODER_HEADERS}
+)
+target_link_libraries(amf_init_test PRIVATE
+    ${WIN_LIBS}
+    spdlog::spdlog
+)
+target_compile_options(amf_init_test PRIVATE /W4 /WX /permissive-)
+
+# ---------------------------------------------------------------------------
+# amf_encode_test — Day 7: DXGI capture → AMF encode → stream.h264
+# ---------------------------------------------------------------------------
+add_executable(amf_encode_test
+    ${CAPTURE_SOURCES}
+    ${ENCODER_SOURCES}
+    tools/amf_encode_test.cpp
+    ${CAPTURE_HEADERS}
+    ${ENCODER_HEADERS}
+)
+target_link_libraries(amf_encode_test PRIVATE
+    ${WIN_LIBS}
+    spdlog::spdlog
+)
+target_compile_options(amf_encode_test PRIVATE /W4 /WX /permissive-)
+
+# ---------------------------------------------------------------------------
+# amf_pipeline_test — Day 8: threaded capture + encode + RingBuffer writer
+# ---------------------------------------------------------------------------
+add_executable(amf_pipeline_test
+    ${CAPTURE_SOURCES}
+    ${ENCODER_SOURCES}
+    tools/amf_pipeline_test.cpp
+    ${CAPTURE_HEADERS}
+    ${ENCODER_HEADERS}
+)
+target_link_libraries(amf_pipeline_test PRIVATE
+    ${WIN_LIBS}
+    spdlog::spdlog
+)
+target_compile_options(amf_pipeline_test PRIVATE /W4 /WX /permissive-)
+
+# ---------------------------------------------------------------------------
+# unit_tests — GoogleTest suite: result.h, capture_types.h, encoder types,
+#              IEncoder contract, RingBuffer (all edge cases + SPSC stress)
 # ---------------------------------------------------------------------------
 add_executable(unit_tests
     tests/result_test.cpp
     tests/capture_types_test.cpp
+    tests/encoder_types_test.cpp
+    tests/iencoder_test.cpp
+    tests/util/ring_buffer_test.cpp
     ${CAPTURE_HEADERS}
+    ${ENCODER_HEADERS}
 )
 target_link_libraries(unit_tests PRIVATE
     GTest::gtest_main
@@ -156,7 +217,11 @@ add_test(NAME GameStreamUnitTests COMMAND unit_tests)
 # ---------------------------------------------------------------------------
 # Common settings
 # ---------------------------------------------------------------------------
-set_target_properties(capture_test fps_loop_test wgc_test unit_tests PROPERTIES
+set_target_properties(
+    capture_test fps_loop_test wgc_test
+    amf_init_test amf_encode_test amf_pipeline_test
+    unit_tests
+    PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 

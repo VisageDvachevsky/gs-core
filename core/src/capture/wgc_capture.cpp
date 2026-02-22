@@ -240,6 +240,10 @@ CaptureStats WGCCapture::get_stats() const {
     return impl_->stats_;
 }
 
+ID3D11Device* WGCCapture::get_device() const {
+    return impl_->d3d11_device_.Get();
+}
+
 // ---------------------------------------------------------------------------
 // WGCCaptureImpl — initialization helpers
 // ---------------------------------------------------------------------------

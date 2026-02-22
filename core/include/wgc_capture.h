@@ -46,6 +46,10 @@ public:
     /// Get capture statistics.
     CaptureStats get_stats() const override;
 
+    /// Get the D3D11 device created internally by WGC.
+    /// Returns nullptr if not initialized.
+    ID3D11Device* get_device() const override;
+
 private:
     std::unique_ptr<WGCCaptureImpl> impl_;
 };

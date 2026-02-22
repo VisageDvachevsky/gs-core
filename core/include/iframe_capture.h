@@ -3,6 +3,7 @@
 #include "result.h"
 #include "capture_types.h"
 #include <cstdint>
+#include <d3d11.h>
 
 namespace gamestream {
 
@@ -35,6 +36,12 @@ public:
 
     /// Get capture statistics.
     virtual CaptureStats get_stats() const = 0;
+
+    /// Get the D3D11 device used internally by this capture backend.
+    /// Required for zero-copy encoder initialization: pass this device to
+    /// IEncoder::initialize() so the encoder can share the same GPU context.
+    /// Returns nullptr if not initialized.
+    virtual ID3D11Device* get_device() const = 0;
 };
 
 } // namespace gamestream

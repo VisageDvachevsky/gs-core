@@ -5,7 +5,7 @@
 #include "capture_types.h"
 
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_5.h>   // IDXGIOutput5 (DuplicateOutput1 with explicit format)
 #include <wrl/client.h>
 #include <cstdint>
 #include <memory>
@@ -35,6 +35,7 @@ public:
     void get_resolution(uint32_t& width, uint32_t& height) const override;
     bool is_initialized() const override { return duplication_ != nullptr; }
     CaptureStats get_stats() const override { return stats_; }
+    ID3D11Device* get_device() const override { return device_.Get(); }
 
     // Additional DXGI-specific methods
     [[nodiscard]] bool initialize_with_config(const CaptureConfig& config);
@@ -54,7 +55,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication_;
     Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter_;
-    Microsoft::WRL::ComPtr<IDXGIOutput1> output_;
+    Microsoft::WRL::ComPtr<IDXGIOutput5> output_;  // DuplicateOutput1 lives in IDXGIOutput5
 
     uint32_t width_ = 0;
     uint32_t height_ = 0;

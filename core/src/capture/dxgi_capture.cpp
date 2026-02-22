@@ -122,7 +122,7 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
 }
 
 bool DXGICapture::create_duplication(uint32_t output_index) {
-    // EnumOutputs returns IDXGIOutput; QueryInterface up to IDXGIOutput1 for DuplicateOutput1.
+    // EnumOutputs returns IDXGIOutput; QueryInterface up to IDXGIOutput5 for DuplicateOutput1.
     ComPtr<IDXGIOutput> output;
     HRESULT hr = adapter_->EnumOutputs(output_index, &output);
     if (FAILED(hr)) {
@@ -132,7 +132,7 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
 
     hr = output.As(&output_);
     if (FAILED(hr)) {
-        spdlog::error("[DXGI] QueryInterface to IDXGIOutput1 failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        spdlog::error("[DXGI] QueryInterface to IDXGIOutput5 failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -172,17 +172,21 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
         spdlog::info("[DXGI] Monitor refresh rate: {:.2f} Hz", refresh_rate);
     }
 
-    // DuplicateOutput1 with explicit BGRA format — avoids format surprises from
-    // the older DuplicateOutput which returns whatever the driver selects.
+    // Try DuplicateOutput1 (DXGI 1.5) with explicit BGRA format first.
+    // Falls back to DuplicateOutput (DXGI 1.2) if the driver returns UNSUPPORTED
+    // (e.g. HDR mode, some AMD configurations, certain remote session types).
     DXGI_FORMAT formats[] = { DXGI_FORMAT_B8G8R8A8_UNORM };
     hr = output_->DuplicateOutput1(device_.Get(), 0, 1, formats, &duplication_);
 
+    if (hr == DXGI_ERROR_UNSUPPORTED) {
+        spdlog::warn("[DXGI] DuplicateOutput1 unsupported (HDR/driver limitation), falling back to DuplicateOutput");
+        hr = output_->DuplicateOutput(device_.Get(), &duplication_);
+    }
+
     if (FAILED(hr)) {
-        spdlog::error("[DXGI] DuplicateOutput1 failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        spdlog::error("[DXGI] DuplicateOutput failed: 0x{:08X}", static_cast<uint32_t>(hr));
         if (hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) {
             spdlog::error("[DXGI] Too many applications using desktop duplication (max 1-2)");
-        } else if (hr == DXGI_ERROR_UNSUPPORTED) {
-            spdlog::error("[DXGI] Desktop duplication not supported (fullscreen exclusive mode?)");
         } else if (hr == E_ACCESSDENIED) {
             spdlog::error("[DXGI] Access denied — another application is already capturing");
         }
@@ -220,7 +224,7 @@ Result<CaptureFrame> DXGICapture::acquire_frame(uint64_t timeout_ms) {
 
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         spdlog::warn("[DXGI] Access lost, attempting to recreate duplication...");
-        recreate_duplication();
+        [[maybe_unused]] bool recreated = recreate_duplication();
         return Result<CaptureFrame>::error("access_lost");
     }
 

@@ -201,9 +201,13 @@ TEST(ResultTest, StringTypeValueRvalueMovesOut) {
 
 // ===========================================================================
 // Death tests — assert fires when value() called on error state.
-// In Release builds (NDEBUG defined) EXPECT_DEBUG_DEATH is a no-op;
-// the assert lines are still covered by success-path tests above.
+// Compiled only in Debug builds: in Release (NDEBUG), assert is a no-op
+// and std::get throws std::bad_variant_access, which would crash the process
+// outside the death test sandbox — so the tests are gated on NDEBUG.
+// The assert paths are indirectly covered by success-path tests above.
 // ===========================================================================
+
+#ifndef NDEBUG
 
 TEST(ResultDeathTest, LvalueValueOnErrorState) {
     EXPECT_DEBUG_DEATH(
@@ -230,6 +234,8 @@ TEST(ResultDeathTest, RvalueValueOnErrorState) {
         },
         ".*");
 }
+
+#endif  // NDEBUG
 
 // ===========================================================================
 // VoidResult
