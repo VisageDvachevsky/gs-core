@@ -40,21 +40,16 @@ struct WindowInfo {
 };
 
 static BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lparam) {
-    if (!IsWindowVisible(hwnd)) return TRUE;
-
-    // Skip minimized windows
-    if (IsIconic(hwnd)) return TRUE;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
 
     wchar_t title[256];
     if (GetWindowTextW(hwnd, title, static_cast<int>(std::size(title))) == 0) return TRUE;
     if (title[0] == L'\0') return TRUE;
 
     // Only windows with a title bar (skip tool windows, popups, etc.)
-    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-    if (!(style & WS_CAPTION)) return TRUE;
+    if (!(GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION)) return TRUE;
 
-    auto* list = reinterpret_cast<std::vector<WindowInfo>*>(lparam);
-    list->push_back({ hwnd, title });
+    reinterpret_cast<std::vector<WindowInfo>*>(lparam)->push_back({ hwnd, title });
     return TRUE;
 }
 
@@ -66,13 +61,30 @@ static std::vector<WindowInfo> enumerate_windows() {
 
 static std::string to_utf8(const std::wstring& wide) {
     if (wide.empty()) return {};
-    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1,
-                                   nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return {};
-    std::string result(size - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1,
-                        result.data(), size, nullptr, nullptr);
-    return result;
+    int n = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(n - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+// Shows window list, reads user choice, returns selected HWND (0 = foreground).
+static uintptr_t select_window() {
+    auto windows = enumerate_windows();
+    std::cout << "\nAvailable windows:\n";
+    std::cout << "  [0] Foreground window\n";
+    for (size_t i = 0; i < windows.size(); ++i) {
+        std::cout << "  [" << (i + 1) << "] " << to_utf8(windows[i].title) << "\n";
+    }
+    std::cout << "\nSelect window number: ";
+    int choice = 0;
+    std::cin >> choice;
+    if (choice > 0 && choice <= static_cast<int>(windows.size())) {
+        spdlog::info("Selected: {}", to_utf8(windows[choice - 1].title));
+        return reinterpret_cast<uintptr_t>(windows[choice - 1].hwnd);
+    }
+    spdlog::info("Using foreground window");
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +103,6 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
     }
 
     uint64_t bytes = 0;
-
     while (true) {
         EncodedFrame frame;
         if (write_queue.try_pop(frame)) {
@@ -104,7 +115,7 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
         }
     }
 
-    // Drain any remaining frames after encode thread signals done
+    // Drain remaining frames after encode thread signals done
     EncodedFrame frame;
     while (write_queue.try_pop(frame)) {
         out.write(reinterpret_cast<const char*>(frame.data.data()),
@@ -118,12 +129,56 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
 }
 
 // ---------------------------------------------------------------------------
+// Encode loop helpers
+// ---------------------------------------------------------------------------
+
+// Non-blocking WGC poll. Updates last_frame if a new one arrived.
+// Returns true = new frame; false = duplicate (last_frame unchanged).
+static bool poll_new_frame(WGCCapture& capture, CaptureFrame& last_frame) {
+    auto cap = capture.acquire_frame(0);  // 0 ms = do not wait
+    if (!cap) return false;
+    last_frame = cap.value();
+    capture.release_frame();
+    return true;
+}
+
+struct FrameMetrics { bool ok; bool is_kf; double enc_ms; size_t bytes; };
+
+// Encodes frame and pushes to the write queue.
+static FrameMetrics encode_and_push(AMFEncoder&                  encoder,
+                                    const CaptureFrame&          frame,
+                                    RingBuffer<EncodedFrame, 8>& queue,
+                                    uint32_t                     frame_idx)
+{
+    auto t0  = steady_clock::now();
+    auto enc = encoder.encode(frame);
+    auto t1  = steady_clock::now();
+
+    if (!enc) {
+        spdlog::warn("[encode] Frame {}: {}", frame_idx, enc.error());
+        return {false, false, 0.0, 0};
+    }
+
+    EncodedFrame ef = std::move(enc.value());
+    const FrameMetrics m{true, ef.is_keyframe,
+                         duration<double, std::milli>(t1 - t0).count(),
+                         ef.data.size()};
+
+    spdlog::trace("Frame {:4}: {:3s} | {:6} B | {:.2f}ms",
+                  frame_idx, m.is_kf ? "IDR" : "  P", m.bytes, m.enc_ms);
+
+    while (!queue.try_push(std::move(ef))) {
+        std::this_thread::yield();
+    }
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // Encode loop — fixed 60 fps output with frame duplication.
 //
 // WGC delivers frames whenever screen content changes.  We tick at a fixed
-// 16.67 ms (60 fps) interval; if no new WGC frame arrived since the last
-// tick, we re-encode the previous texture (duplicate frame).  This keeps
-// the output bitstream at exactly 60 fps regardless of source frame rate.
+// 16.67 ms (60 fps) interval; if no new WGC frame arrived, we re-encode the
+// previous texture to keep the bitstream at exactly 60 fps.
 // ---------------------------------------------------------------------------
 
 static int encode_loop(WGCCapture&                  capture,
@@ -131,99 +186,56 @@ static int encode_loop(WGCCapture&                  capture,
                        RingBuffer<EncodedFrame, 8>& write_queue,
                        double                       duration_sec)
 {
-    constexpr int  kTargetFps      = 60;
-    const auto     frame_interval  = std::chrono::nanoseconds(1'000'000'000 / kTargetFps);
-    const auto     deadline        = steady_clock::now() + duration<double>(duration_sec);
+    constexpr int kTargetFps    = 60;
+    const auto frame_interval   = std::chrono::nanoseconds(1'000'000'000 / kTargetFps);
+    const auto deadline         = steady_clock::now() + duration<double>(duration_sec);
 
-    uint32_t frames_out = 0;
-    uint32_t keyframes  = 0;
-    uint32_t duplicates = 0;
-    double   sum_enc_ms = 0.0;
-
-    // Wait for the very first WGC frame before we start the fixed-rate clock.
     encoder.request_keyframe();
     CaptureFrame last_frame{};
-    {
-        spdlog::debug("[encode] Waiting for first frame...");
+    {   // Block until the first WGC frame arrives
         auto cap = capture.acquire_frame(5000);
-        if (!cap) {
-            spdlog::error("No frame received within 5 s: {}", cap.error());
-            return EXIT_FAILURE;
-        }
+        if (!cap) { spdlog::error("No frame in 5 s: {}", cap.error()); return EXIT_FAILURE; }
         last_frame = cap.value();
         capture.release_frame();
     }
 
-    auto next_tick = steady_clock::now();
+    auto     next_tick     = steady_clock::now();
+    auto     last_log_time = steady_clock::now();
+    uint32_t frames_out = 0, keyframes = 0, duplicates = 0;
+    double   sum_enc_ms = 0.0;
 
     while (steady_clock::now() < deadline) {
-        // Sleep until the next 60 fps slot.
         next_tick += frame_interval;
         std::this_thread::sleep_until(next_tick);
 
-        // Non-blocking check: grab the newest WGC frame if one arrived.
-        // 0 ms timeout → returns immediately regardless of frame availability.
-        auto cap    = capture.acquire_frame(0);
-        bool is_dup = true;
-        if (cap) {
-            last_frame = cap.value();
-            capture.release_frame();
-            is_dup = false;
-        } else {
-            ++duplicates;
-        }
+        if (!poll_new_frame(capture, last_frame)) ++duplicates;
 
-        auto t0  = steady_clock::now();
-        auto enc = encoder.encode(last_frame);
-        auto t1  = steady_clock::now();
-
-        if (!enc) {
-            spdlog::warn("[encode] Frame {}: {}", frames_out, enc.error());
-            continue;
-        }
-
-        EncodedFrame ef = std::move(enc.value());
-
-        const bool   is_kf    = ef.is_keyframe;
-        const size_t byte_cnt = ef.data.size();
-        if (is_kf) keyframes++;
-
-        while (!write_queue.try_push(std::move(ef))) {
-            std::this_thread::yield();
-        }
-
-        const double enc_ms = duration<double, std::milli>(t1 - t0).count();
-        sum_enc_ms += enc_ms;
-
-        // Only log unique frames to avoid log spam
-        if (!is_dup) {
-            spdlog::info("Frame {:4}: {:3s} | {:6} bytes | Encode {:.2f}ms",
-                         frames_out, is_kf ? "IDR" : "  P", byte_cnt, enc_ms);
-        }
-
+        auto m = encode_and_push(encoder, last_frame, write_queue, frames_out);
+        if (!m.ok) continue;
+        if (m.is_kf) keyframes++;
+        sum_enc_ms += m.enc_ms;
         ++frames_out;
+
+        // Log once per second (not per-frame — principle 7.3)
+        auto now = steady_clock::now();
+        if (duration<double>(now - last_log_time).count() >= 1.0) {
+            const double elapsed = duration<double>(now - (deadline - duration<double>(duration_sec))).count();
+            spdlog::info("[{:4.1f}s] Frames: {:4} | Dups: {:4} | Encode avg: {:.2f}ms",
+                         elapsed, frames_out, duplicates,
+                         frames_out > 0 ? sum_enc_ms / frames_out : 0.0);
+            last_log_time = now;
+        }
     }
 
-    if (frames_out == 0) {
-        spdlog::error("No frames encoded");
-        return EXIT_FAILURE;
-    }
+    if (frames_out == 0) { spdlog::error("No frames encoded"); return EXIT_FAILURE; }
 
-    const uint32_t unique_frames = frames_out - duplicates;
-    const double   avg_enc       = sum_enc_ms / frames_out;
-    const double   fps           = frames_out / duration_sec;
-
-    spdlog::info("=== Stats: {} frames out ({} unique + {} duplicated), {:.1f}s ===",
-                 frames_out, unique_frames, duplicates, duration_sec);
-    spdlog::info("    Encode  avg: {:.2f} ms", avg_enc);
-    spdlog::info("    Output FPS:  {:.1f}", fps);
-
-    if (avg_enc > 6.0) {
-        spdlog::warn("Encode latency {:.2f} ms exceeds 6 ms target", avg_enc);
-    } else {
-        spdlog::info("Latency target MET: encode avg {:.2f} ms < 6 ms", avg_enc);
-    }
-
+    const double avg_enc = sum_enc_ms / frames_out;
+    spdlog::info("=== Stats: {} frames ({} unique + {} dups), {:.1f}s, FPS: {:.1f} ===",
+                 frames_out, frames_out - duplicates, duplicates,
+                 duration_sec, frames_out / duration_sec);
+    spdlog::info("    Encode avg: {:.2f} ms", avg_enc);
+    if (avg_enc > 6.0) spdlog::warn("Encode latency exceeds 6 ms target");
+    else               spdlog::info("Latency target MET: {:.2f} ms < 6 ms", avg_enc);
     return EXIT_SUCCESS;
 }
 
@@ -238,33 +250,8 @@ int main(int argc, char* argv[]) {
     const double duration_sec = (argc > 1) ? std::stod(argv[1]) : 10.0;
     spdlog::info("=== WGC Encode Test: {:.0f}s recording ===", duration_sec);
 
-    // -----------------------------------------------------------------------
-    // Step 1: List windows and let user choose
-    // -----------------------------------------------------------------------
-    auto windows = enumerate_windows();
+    const uintptr_t hwnd_value = select_window();
 
-    std::cout << "\nAvailable windows:\n";
-    std::cout << "  [0] Foreground window (whichever is active when capture starts)\n";
-    for (size_t i = 0; i < windows.size(); ++i) {
-        std::cout << "  [" << (i + 1) << "] "
-                  << to_utf8(windows[i].title) << "\n";
-    }
-
-    std::cout << "\nSelect window number: ";
-    int choice = 0;
-    std::cin >> choice;
-
-    uintptr_t hwnd_value = 0;  // 0 = foreground window
-    if (choice > 0 && choice <= static_cast<int>(windows.size())) {
-        hwnd_value = reinterpret_cast<uintptr_t>(windows[choice - 1].hwnd);
-        spdlog::info("Selected: {}", to_utf8(windows[choice - 1].title));
-    } else {
-        spdlog::info("Using foreground window");
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 2: WGC capture init
-    // -----------------------------------------------------------------------
     WGCCapture capture;
     if (auto r = capture.initialize(hwnd_value); !r) {
         spdlog::error("WGC init failed: {}", r.error());
@@ -273,25 +260,14 @@ int main(int argc, char* argv[]) {
 
     uint32_t width = 0, height = 0;
     capture.get_resolution(width, height);
-    spdlog::info("Capture resolution: {}x{}", width, height);
+    spdlog::info("Capture: {}x{}", width, height);
 
     ID3D11Device* device = capture.get_device();
-    if (!device) {
-        spdlog::error("WGC returned null D3D11 device");
-        return EXIT_FAILURE;
-    }
+    if (!device) { spdlog::error("WGC returned null D3D11 device"); return EXIT_FAILURE; }
 
-    // -----------------------------------------------------------------------
-    // Step 3: AMF encoder init — reuses WGC's D3D11 device (zero-copy path)
-    // -----------------------------------------------------------------------
     AMFEncoder encoder;
-
     EncoderConfig cfg;
-    cfg.width       = width;
-    cfg.height      = height;
-    cfg.fps         = 60;
-    cfg.bitrate_bps = 15'000'000;
-
+    cfg.width = width; cfg.height = height; cfg.fps = 60; cfg.bitrate_bps = 15'000'000;
     if (auto r = encoder.initialize(device, cfg); !r) {
         spdlog::error("AMF init failed: {}", r.error());
         return EXIT_FAILURE;
@@ -299,35 +275,23 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Pipeline ready. Recording for {:.0f}s...", duration_sec);
 
-    // -----------------------------------------------------------------------
-    // Step 4: Ring buffer + writer thread
-    // -----------------------------------------------------------------------
+    const std::string output_path = "window_capture.h264";
     RingBuffer<EncodedFrame, 8> write_queue;
     std::atomic<bool>     encode_done{false};
     std::atomic<uint64_t> total_bytes{0};
 
-    const std::string output_path = "window_capture.h264";
+    std::thread writer(writer_thread_fn, std::ref(write_queue),
+                       std::ref(encode_done), std::cref(output_path), std::ref(total_bytes));
 
-    std::thread writer(writer_thread_fn,
-                       std::ref(write_queue),
-                       std::ref(encode_done),
-                       std::cref(output_path),
-                       std::ref(total_bytes));
-
-    // -----------------------------------------------------------------------
-    // Step 5: Encode loop (calling thread)
-    // -----------------------------------------------------------------------
     const int result = encode_loop(capture, encoder, write_queue, duration_sec);
 
     encode_done.store(true, std::memory_order_release);
     writer.join();
 
     spdlog::info("Output: {} ({} bytes)", output_path, total_bytes.load());
-
     if (result == EXIT_SUCCESS) {
         spdlog::info("=== wgc_encode_test PASSED ===");
         std::cout << "\nDone! Play with: ffplay " << output_path << "\n";
     }
-
     return result;
 }
