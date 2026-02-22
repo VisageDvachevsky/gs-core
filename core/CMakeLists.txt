@@ -195,6 +195,7 @@ target_compile_options(amf_pipeline_test PRIVATE /W4 /WX /permissive-)
 # wgc_encode_test — per-window WGC capture + AMF H.264 encode
 # ---------------------------------------------------------------------------
 add_executable(wgc_encode_test
+    ${CAPTURE_SOURCES}
     src/capture/wgc_capture.cpp
     ${ENCODER_SOURCES}
     tools/wgc_encode_test.cpp

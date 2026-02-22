@@ -120,8 +120,12 @@ VoidResult AMFEncoderImpl::configure_encoder() {
     // and includes the AMF property name (an ASCII-range wchar_t* constant) in the
     // error message.  Template lambda (C++20) avoids the old AMF_SET macro.
     auto narrow_name = [](const wchar_t* w) -> std::string {
-        // AMF property name constants are ASCII-range wide strings — direct narrow is safe.
-        return {w, w + std::wcslen(w)};
+        // AMF property name constants are ASCII-range wide strings — convert safely.
+        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 0) return {};
+        std::string result(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, result.data(), len, nullptr, nullptr);
+        return result;
     };
     auto set = [&]<typename V>(const wchar_t* prop, V val) -> VoidResult {
         AMF_RESULT r = encoder_->SetProperty(prop, static_cast<amf_int64>(val));

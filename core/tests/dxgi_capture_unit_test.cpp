@@ -56,7 +56,7 @@ TEST(DXGICaptureTest, AcquireFrameBeforeInitReturnsError) {
 
 TEST(DXGICaptureTest, AcquireFrameBeforeInitDoesNotChangeStats) {
     DXGICapture capture;
-    capture.acquire_frame(0);
+    (void)capture.acquire_frame(0);
     EXPECT_EQ(capture.get_stats().frames_captured, 0u);
 }
 

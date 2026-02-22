@@ -1,14 +1,19 @@
-/// wgc_encode_test — per-window WGC capture + AMF H.264 encode
+/// wgc_encode_test — capture + AMF H.264 encode
+///
+/// Supports two capture backends:
+///   WGC  (default)  — per-window Windows.Graphics.Capture.
+///   DXGI (--dxgi)   — full-desktop DXGI Desktop Duplication.
+///                     Works with exclusive fullscreen and Independent-Flip games.
 ///
 /// Pipeline:
-///   [Main Thread]   WGC acquire → AMF encode → RingBuffer<EncodedFrame, 8>
-///   [Writer Thread]                             RingBuffer → file write
+///   [Main Thread]   Capture acquire → AMF encode → RingBuffer<EncodedFrame, 8>
+///   [Writer Thread]                                RingBuffer → file write
 ///
-/// Usage: wgc_encode_test.exe [duration_seconds]
+/// Usage: wgc_encode_test.exe [duration_seconds] [--dxgi]
 ///   duration_seconds — recording duration in seconds (default: 10)
-///
-/// Output: window_capture.h264 (verify with: ffplay window_capture.h264)
+///   --dxgi           — use DXGI Desktop Duplication instead of WGC
 
+#include "dxgi_capture.h"
 #include "wgc_capture.h"
 #include "amf_encoder.h"
 #include "util/ring_buffer.h"
@@ -21,8 +26,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -37,7 +44,7 @@ static constexpr uint32_t kDefaultDurationS = 10;
 static constexpr double   kEncodeTargetMs   = 6.0;         // latency budget target
 
 // ---------------------------------------------------------------------------
-// Window enumeration
+// Window enumeration (WGC mode only)
 // ---------------------------------------------------------------------------
 
 struct WindowInfo {
@@ -49,12 +56,10 @@ static BOOL CALLBACK enum_windows_proc(HWND hwnd, LPARAM lparam) {
     if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
 
     wchar_t title[256];
-    if (GetWindowTextW(hwnd, title, static_cast<int>(std::size(title))) == 0) return TRUE;
-    if (title[0] == L'\0') return TRUE;
+    int title_len = GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
+    if (title_len == 0) return TRUE;
 
-    // Only windows with a title bar (skip tool windows, popups, etc.)
-    if (!(GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION)) return TRUE;
-
+    // Capture all visible windows including borderless (no WS_CAPTION check)
     reinterpret_cast<std::vector<WindowInfo>*>(lparam)->push_back({ hwnd, title });
     return TRUE;
 }
@@ -102,7 +107,7 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
                               const std::string&           output_path,
                               std::atomic<uint64_t>&       total_bytes_written)
 {
-    SetThreadDescription(GetCurrentThread(), L"GameStream WGC Writer");
+    SetThreadDescription(GetCurrentThread(), L"GameStream Writer");
 
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
@@ -140,9 +145,9 @@ static void writer_thread_fn(RingBuffer<EncodedFrame, 8>& write_queue,
 // Encode loop helpers
 // ---------------------------------------------------------------------------
 
-// Non-blocking WGC poll. Updates last_frame if a new one arrived.
+// Non-blocking capture poll. Updates last_frame if a new one arrived.
 // Returns true = new frame; false = duplicate (last_frame unchanged).
-static bool poll_new_frame(WGCCapture& capture, CaptureFrame& last_frame) {
+static bool poll_new_frame(IFrameCapture& capture, CaptureFrame& last_frame) {
     auto cap = capture.acquire_frame(0);  // 0 ms = do not wait
     if (!cap) return false;
     last_frame = cap.value();
@@ -181,9 +186,9 @@ static FrameMetrics encode_and_push(AMFEncoder&                  encoder,
     return m;
 }
 
-// Blocks until the first WGC frame arrives (up to 5 s).
+// Blocks until the first capture frame arrives (up to 5 s).
 // Returns the frame on success, empty optional on timeout.
-static std::optional<CaptureFrame> wait_first_frame(WGCCapture& capture) {
+static std::optional<CaptureFrame> wait_first_frame(IFrameCapture& capture) {
     auto cap = capture.acquire_frame(5000);
     if (!cap) {
         spdlog::error("No frame in 5 s: {}", cap.error());
@@ -197,12 +202,11 @@ static std::optional<CaptureFrame> wait_first_frame(WGCCapture& capture) {
 // ---------------------------------------------------------------------------
 // Encode loop — fixed kTargetFps output with frame duplication.
 //
-// WGC delivers frames whenever screen content changes.  We tick at a fixed
-// 16.67 ms interval; if no new WGC frame arrived, we re-encode the previous
-// texture to keep the bitstream at exactly kTargetFps.
+// Ticks at a fixed 16.67 ms interval; if no new capture frame arrived,
+// re-encodes the previous texture to keep the bitstream at exactly kTargetFps.
 // ---------------------------------------------------------------------------
 
-static int encode_loop(WGCCapture&                  capture,
+static int encode_loop(IFrameCapture&               capture,
                        AMFEncoder&                  encoder,
                        RingBuffer<EncodedFrame, 8>& write_queue,
                        double                       duration_sec)
@@ -260,6 +264,59 @@ static int encode_loop(WGCCapture&                  capture,
 }
 
 // ---------------------------------------------------------------------------
+// remux_to_mp4 — wraps raw H.264 in an MP4 container via ffmpeg.
+//
+// Sets the correct -framerate so players don't fall back to 25fps heuristics.
+// Runs ffmpeg in a hidden window; waits up to 60 s for completion.
+// Returns the .mp4 path on success, empty string on failure.
+// ---------------------------------------------------------------------------
+static std::string remux_to_mp4(const std::string& h264_path, uint32_t fps) {
+    const std::string mp4_path =
+        h264_path.substr(0, h264_path.rfind('.')) + ".mp4";
+
+    // ffmpeg -y             : overwrite output if exists
+    // -framerate <fps>      : set input frame rate (fixes 25 fps heuristic)
+    // -i <in>               : input file
+    // -c copy               : stream copy — no re-encode
+    // -movflags +faststart  : move moov atom to front (better for streaming)
+    // -loglevel warning     : suppress noisy info output
+    std::string cmd = std::format(
+        "ffmpeg -y -framerate {} -i \"{}\" -c copy -movflags +faststart \"{}\" -loglevel warning",
+        fps, h264_path, mp4_path);
+
+    STARTUPINFOA si{};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+
+    // CreateProcessA requires a writable lpCommandLine buffer.
+    std::vector<char> cmd_buf(cmd.begin(), cmd.end());
+    cmd_buf.push_back('\0');
+
+    if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr,
+                        FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        spdlog::warn("[remux] ffmpeg not found in PATH (CreateProcess error 0x{:08X})",
+                     static_cast<uint32_t>(GetLastError()));
+        return {};
+    }
+
+    WaitForSingleObject(pi.hProcess, 60'000);  // Wait up to 60 s
+
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exit_code != 0) {
+        spdlog::warn("[remux] ffmpeg exited with code {}", exit_code);
+        return {};
+    }
+    return mp4_path;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -269,23 +326,47 @@ int main(int argc, char* argv[]) {
 
     SetThreadDescription(GetCurrentThread(), L"GameStream Encode");
 
-    const double duration_sec = (argc > 1) ? std::stod(argv[1]) : kDefaultDurationS;
-    spdlog::info("=== WGC Encode Test: {:.0f}s recording ===", duration_sec);
+    // Parse arguments: [duration_seconds] [--dxgi]
+    double duration_sec = kDefaultDurationS;
+    bool   use_dxgi     = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg(argv[i]);
+        if (arg == "--dxgi") {
+            use_dxgi = true;
+        } else {
+            try { duration_sec = std::stod(argv[i]); } catch (...) {}
+        }
+    }
 
-    const uintptr_t hwnd_value = select_window();
+    const char* mode_name = use_dxgi ? "DXGI" : "WGC";
+    spdlog::info("=== Encode Test [{}]: {:.0f}s recording ===", mode_name, duration_sec);
 
-    WGCCapture capture;
-    if (auto r = capture.initialize(hwnd_value); !r) {
-        spdlog::error("WGC init failed: {}", r.error());
-        return EXIT_FAILURE;
+    // Create and initialize capture backend
+    std::unique_ptr<IFrameCapture> capture;
+    if (use_dxgi) {
+        auto cap = std::make_unique<DXGICapture>();
+        // initialize(0) = first AMD adapter
+        if (auto r = cap->initialize(0); !r) {
+            spdlog::error("DXGI init failed: {}", r.error());
+            return EXIT_FAILURE;
+        }
+        capture = std::move(cap);
+    } else {
+        const uintptr_t hwnd_value = select_window();
+        auto cap = std::make_unique<WGCCapture>();
+        if (auto r = cap->initialize(hwnd_value); !r) {
+            spdlog::error("WGC init failed: {}", r.error());
+            return EXIT_FAILURE;
+        }
+        capture = std::move(cap);
     }
 
     uint32_t width = 0, height = 0;
-    capture.get_resolution(width, height);
-    spdlog::info("Capture: {}x{}", width, height);
+    capture->get_resolution(width, height);
+    spdlog::info("Capture [{}]: {}x{}", mode_name, width, height);
 
-    ID3D11Device* device = capture.get_device();
-    if (!device) { spdlog::error("WGC returned null D3D11 device"); return EXIT_FAILURE; }
+    ID3D11Device* device = capture->get_device();
+    if (!device) { spdlog::error("Capture returned null D3D11 device"); return EXIT_FAILURE; }
 
     AMFEncoder encoder;
     EncoderConfig cfg;
@@ -300,7 +381,7 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Pipeline ready. Recording for {:.0f}s...", duration_sec);
 
-    const std::string output_path = "window_capture.h264";
+    const std::string output_path = use_dxgi ? "desktop_capture.h264" : "window_capture.h264";
     RingBuffer<EncodedFrame, 8> write_queue;
     std::atomic<bool>     encode_done{false};
     std::atomic<uint64_t> total_bytes{0};
@@ -313,17 +394,29 @@ int main(int argc, char* argv[]) {
             writer_thread_fn(write_queue, encode_done, output_path, total_bytes);
         });
 
-        result = encode_loop(capture, encoder, write_queue, duration_sec);
+        result = encode_loop(*capture, encoder, write_queue, duration_sec);
 
         encode_done.store(true, std::memory_order_release);
         // writer joins automatically when the block exits
     }
     // total_bytes is fully written now
 
-    spdlog::info("Output: {} ({} bytes)", output_path, total_bytes.load());
+    spdlog::info("Raw H.264: {} ({} bytes)", output_path, total_bytes.load());
     if (result == EXIT_SUCCESS) {
         spdlog::info("=== wgc_encode_test PASSED ===");
-        std::cout << "\nDone! Play with: ffplay " << output_path << "\n";
+
+        spdlog::info("Remuxing to MP4...");
+        const std::string mp4_path = remux_to_mp4(output_path, kTargetFps);
+        if (!mp4_path.empty()) {
+            DeleteFileA(output_path.c_str());
+            spdlog::info("Output: {}", mp4_path);
+            std::cout << "\nDone! Play with: ffplay " << mp4_path << "\n";
+        } else {
+            // ffmpeg unavailable or failed — keep H.264, advise explicit fps
+            spdlog::warn("Remux failed — raw H.264 preserved");
+            std::cout << "\nDone! Play with: ffplay -framerate " << kTargetFps
+                      << " " << output_path << "\n";
+        }
     }
     return result;
 }

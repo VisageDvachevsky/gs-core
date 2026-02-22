@@ -54,7 +54,7 @@ TEST(AMFEncoderTest, InitializeWithNullDeviceReturnsError) {
 TEST(AMFEncoderTest, InitializeWithNullDeviceDoesNotInitialize) {
     AMFEncoder encoder;
     const EncoderConfig config;
-    encoder.initialize(nullptr, config);
+    (void)encoder.initialize(nullptr, config);
     EXPECT_FALSE(encoder.is_initialized());
 }
 
@@ -73,7 +73,7 @@ TEST(AMFEncoderTest, EncodeWithoutInitializeReturnsError) {
 TEST(AMFEncoderTest, EncodeWithoutInitializeDoesNotChangeStats) {
     AMFEncoder encoder;
     const CaptureFrame frame{};
-    encoder.encode(frame);
+    (void)encoder.encode(frame);
     EXPECT_EQ(encoder.get_stats().frames_encoded, 0u);
 }
 

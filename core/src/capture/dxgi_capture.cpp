@@ -277,12 +277,27 @@ VoidResult DXGICapture::recreate_duplication() {
     duplication_.Reset();
     frame_acquired_ = false;
 
-    if (!create_duplication(config_.output_index)) {
-        return VoidResult::error("Failed to recreate desktop duplication");
+    // E_ACCESSDENIED / DXGI_ERROR_NOT_CURRENTLY_AVAILABLE are transient during
+    // a game's fullscreen/presentation-mode transition (HAGS, DirectFlip, etc.).
+    // Retry up to kMaxRetries times before giving up.
+    static constexpr int   kMaxRetries   = 10;
+    static constexpr DWORD kRetryDelayMs = 100;
+
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        if (attempt > 0) {
+            spdlog::debug("[DXGI] Recreate attempt {}/{}, waiting {}ms...",
+                          attempt + 1, kMaxRetries, kRetryDelayMs);
+            Sleep(kRetryDelayMs);
+        }
+        if (create_duplication(config_.output_index)) {
+            spdlog::info("[DXGI] Duplication recreated successfully{}",
+                         attempt > 0 ? std::format(" (attempt {})", attempt + 1) : "");
+            return {};
+        }
     }
 
-    spdlog::info("[DXGI] Duplication recreated successfully");
-    return {};
+    return VoidResult::error(
+        std::format("Failed to recreate desktop duplication after {} attempts", kMaxRetries));
 }
 
 // Static utility — raw D3D11 pointers are passed in (caller owns them).

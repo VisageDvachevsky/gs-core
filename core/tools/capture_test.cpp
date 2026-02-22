@@ -78,7 +78,7 @@ int main() {
         frame.texture->GetDevice(&device);
         device->GetImmediateContext(&context);
 
-        bool saved = DXGICapture::save_texture_to_bmp(device.Get(), context.Get(), frame.texture.Get(), filename.str());
+        auto saved = DXGICapture::save_texture_to_bmp(device.Get(), context.Get(), frame.texture.Get(), filename.str());
 
         capture.release_frame();
 
