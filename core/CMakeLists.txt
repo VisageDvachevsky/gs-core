@@ -13,6 +13,13 @@ set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10")
 set(WINDOWS_SDK_VERSION "10.0.26100.0")
 
 # ---------------------------------------------------------------------------
+# CRT selection — must match libwebrtc.lib which is compiled with /MT.
+# All targets in this project (including FetchContent deps spdlog + gtest)
+# must use the same CRT to avoid LNK2038 RuntimeLibrary mismatch errors.
+# ---------------------------------------------------------------------------
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded" CACHE STRING "" FORCE)
+
+# ---------------------------------------------------------------------------
 # Dependencies — self-contained via FetchContent (no system installs needed)
 # ---------------------------------------------------------------------------
 include(FetchContent)
@@ -28,7 +35,8 @@ FetchContent_Declare(spdlog
 FetchContent_MakeAvailable(spdlog)
 
 # Google Test — unit test framework
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+# gtest_force_shared_crt OFF: keep /MT consistent with CMAKE_MSVC_RUNTIME_LIBRARY.
+set(gtest_force_shared_crt OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
     GIT_TAG        v1.15.2
@@ -264,20 +272,114 @@ target_compile_options(unit_tests PRIVATE
 
 add_test(NAME GameStreamUnitTests COMMAND unit_tests)
 
+# WebRTC paths
+set(WEBRTC_ROOT "E:/dev/src" CACHE PATH "Path to WebRTC source")
+set(WEBRTC_BUILD_DIR "${WEBRTC_ROOT}/out/Release" CACHE PATH "Path to WebRTC build output")
+
+# WebRTC defines
+add_definitions(
+    -DWEBRTC_WIN
+    -DABSL_ALLOCATOR_NOTHROW=1
+    -DWIN32_LEAN_AND_MEAN
+    -DNOMINMAX
+)
+
+# WebRTC include directories
+include_directories(
+    ${WEBRTC_ROOT}
+    ${WEBRTC_ROOT}/third_party/abseil-cpp
+    ${WEBRTC_ROOT}/third_party/libyuv/include
+)
+
+# WebRTC system libraries
+set(WEBRTC_SYS_LIBS
+    secur32.lib
+    winmm.lib
+    msdmo.lib
+    dmoguids.lib
+    wmcodecdspuuid.lib
+    amstrmid.lib
+    strmiids.lib
+    Iphlpapi.lib
+    dnsapi.lib
+    crypt32.lib
+)
+
+# ---------------------------------------------------------------------------
+# webrtc_streaming (Static Library)
+# ---------------------------------------------------------------------------
+add_library(webrtc_streaming STATIC
+    src/webrtc/webrtc_host.cpp
+    src/webrtc/amf_webrtc_encoder.cpp
+    src/webrtc/capture_video_source.cpp
+    ${CAPTURE_SOURCES}
+    src/capture/wgc_capture.cpp
+    ${ENCODER_SOURCES}
+    ${WEBRTC_ABSTRACT_HEADERS}
+    src/webrtc/amf_webrtc_encoder.h
+    src/webrtc/capture_video_source.h
+)
+target_link_libraries(webrtc_streaming PRIVATE
+    spdlog::spdlog
+    ${WIN_LIBS}
+    ${WINRT_LIBS}
+)
+target_compile_options(webrtc_streaming PRIVATE
+    /W4 /WX /permissive- /bigobj /utf-8
+    /await:strict
+    # Treat WebRTC, abseil-cpp and libyuv headers as external — suppress their
+    # warnings so /WX can be applied to our own code without false positives.
+    # NOTE: use /external:I<path> (no space) to avoid CMake deduplicating the
+    # flag name and leaving bare paths as spurious "source files" on the cl.exe
+    # command line (CMake VS generator de-dups flags that share the same text).
+    "/external:I${WEBRTC_ROOT}"
+    "/external:I${WEBRTC_ROOT}/third_party/abseil-cpp"
+    "/external:I${WEBRTC_ROOT}/third_party/libyuv/include"
+    /external:W0
+)
+
+# ---------------------------------------------------------------------------
+# webrtc_test — Day 12 streaming loop
+# ---------------------------------------------------------------------------
+add_executable(webrtc_test
+    tools/webrtc_test.cpp
+)
+target_link_libraries(webrtc_test PRIVATE
+    webrtc_streaming
+    spdlog::spdlog
+    ${WIN_LIBS}
+    ${WINRT_LIBS}
+    "${WEBRTC_BUILD_DIR}/obj/webrtc.lib"
+    ${WEBRTC_SYS_LIBS}
+    winhttp.lib
+)
+target_compile_options(webrtc_test PRIVATE
+    /W4 /WX /permissive- /bigobj /utf-8
+    /await:strict
+    /EHsc
+)
+
 # ---------------------------------------------------------------------------
 # Common settings
 # ---------------------------------------------------------------------------
 set_target_properties(
     capture_test fps_loop_test wgc_test
     amf_init_test amf_encode_test amf_pipeline_test
-    wgc_encode_test
+    wgc_encode_test webrtc_test
     unit_tests
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# webrtc.lib was compiled with /MT (static CRT, no DLL dependency).
+# Our WebRTC-linked targets must use the same CRT to avoid LNK2038 mismatch.
+# The other targets (unit_tests etc.) keep /MD as set by gtest_force_shared_crt.
+set_property(TARGET webrtc_streaming PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+set_property(TARGET webrtc_test       PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+
 message(STATUS "GameStream Core - CMake Configuration")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Windows SDK: ${CMAKE_SYSTEM_VERSION}")
 message(STATUS "  AMF SDK: ${AMF_SDK_DIR}")
+message(STATUS "  WebRTC Root: ${WEBRTC_ROOT}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")

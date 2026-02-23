@@ -7,7 +7,9 @@
 #include <format>
 
 // Win32 for LoadLibrary
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 // AMF SDK headers — deliberately confined to this translation unit (PIMPL)

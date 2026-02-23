@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GameStream — Stage 3 Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Consolas', 'Courier New', monospace;
+      background: #1e1e1e; color: #d4d4d4;
+      padding: 16px; min-height: 100vh;
+    }
+    h1 { color: #4fc3f7; margin-bottom: 12px; font-size: 18px; }
+    .controls {
+      display: flex; gap: 10px; align-items: center; margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    label { font-size: 13px; }
+    input[type="text"] {
+      background: #2d2d2d; color: #d4d4d4;
+      border: 1px solid #555; padding: 5px 8px;
+      font-family: inherit; font-size: 13px; width: 160px;
+    }
+    button {
+      background: #0e639c; color: #fff;
+      border: none; padding: 6px 14px;
+      cursor: pointer; font-family: inherit; font-size: 13px;
+    }
+    button:disabled { background: #444; cursor: default; }
+    button.danger { background: #7e2020; }
+    #status { font-size: 13px; margin-bottom: 8px; color: #4ec9b0; }
+    video {
+      width: 100%; max-width: 1280px; display: block;
+      background: #000; border: 1px solid #444;
+      margin-bottom: 10px;
+    }
+    #log {
+      background: #252526; border: 1px solid #444;
+      padding: 8px; height: 180px; overflow-y: auto;
+      font-size: 12px; line-height: 1.5;
+    }
+    .log-info  { color: #9cdcfe; }
+    .log-ok    { color: #4ec9b0; }
+    .log-warn  { color: #dcdcaa; }
+    .log-error { color: #f48771; }
+  </style>
+</head>
+<body>
+  <h1>GameStream — Stage 3 WebRTC Test</h1>
+
+  <div class="controls">
+    <label>Session: <input id="session-id" type="text" value="test-session"></label>
+    <button id="btn-connect" onclick="connect()">Connect</button>
+    <button id="btn-disconnect" class="danger" onclick="disconnect()" disabled>Disconnect</button>
+  </div>
+
+  <div id="status">Idle</div>
+  <video id="video" autoplay playsinline controls></video>
+  <div id="log"></div>
+
+  <script>
+    'use strict';
+
+    let pc = null;
+
+    // ------------------------------------------------------------------
+    // Logging helpers
+    // ------------------------------------------------------------------
+    function log(msg, cls = 'log-info') {
+      const div = document.getElementById('log');
+      const row = document.createElement('div');
+      row.className = cls;
+      const now = new Date();
+      const ts = now.toTimeString().slice(0, 8) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      row.textContent = ts + '  ' + msg;
+      div.appendChild(row);
+      div.scrollTop = div.scrollHeight;
+    }
+
+    function setStatus(msg, cls = 'log-info') {
+      document.getElementById('status').textContent = msg;
+      log(msg, cls);
+    }
+
+    // ------------------------------------------------------------------
+    // Connect
+    // ------------------------------------------------------------------
+    async function connect() {
+      const sessionId = document.getElementById('session-id').value.trim() || 'test-session';
+      document.getElementById('btn-connect').disabled = true;
+      setStatus('Fetching offer from server…');
+
+      try {
+        // 1. Fetch offer (server long-polls up to 30 s for the C++ host offer).
+        const offerResp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/offer`);
+        if (!offerResp.ok) {
+          throw new Error(`GET /offer failed: HTTP ${offerResp.status}`);
+        }
+        const offer = await offerResp.json();
+        log(`Offer received: type=${offer.type}, ${offer.sdp.length} chars`);
+
+        // 2. Create PeerConnection.
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+
+        pc.onconnectionstatechange = () => {
+          const s = pc.connectionState;
+          const cls = s === 'connected' ? 'log-ok'
+                    : s === 'failed'    ? 'log-error'
+                    : 'log-info';
+          setStatus('PeerConnection: ' + s, cls);
+          if (s === 'connected') {
+            document.getElementById('btn-disconnect').disabled = false;
+          }
+          if (s === 'failed' || s === 'closed') {
+            document.getElementById('btn-connect').disabled = false;
+          }
+        };
+        pc.oniceconnectionstatechange = () =>
+          log('ICE connection: ' + pc.iceConnectionState);
+
+        // 3. Attach incoming video stream.
+        pc.ontrack = (event) => {
+          log(`Track received: kind=${event.track.kind}`, 'log-ok');
+          if (event.track.kind === 'video') {
+            document.getElementById('video').srcObject = event.streams[0];
+          }
+        };
+
+        // 4. Set remote description (offer from C++ host).
+        await pc.setRemoteDescription(offer);
+        log('Remote description set');
+
+        // 5. Create answer.
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        log('Local description set, waiting for ICE gathering…');
+
+        // 6. Wait for ICE gathering complete (non-trickle — embed all candidates).
+        await new Promise((resolve) => {
+          if (pc.iceGatheringState === 'complete') { resolve(); return; }
+          pc.addEventListener('icegatheringstatechange', function handler() {
+            log('ICE gathering: ' + pc.iceGatheringState);
+            if (pc.iceGatheringState === 'complete') {
+              pc.removeEventListener('icegatheringstatechange', handler);
+              resolve();
+            }
+          });
+        });
+
+        // 7. POST answer to signaling server.
+        const local = pc.localDescription;
+        const answerResp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/answer`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ type: local.type, sdp: local.sdp })
+        });
+        if (!answerResp.ok) {
+          throw new Error(`POST /answer failed: HTTP ${answerResp.status}`);
+        }
+        setStatus('Answer sent — connecting…', 'log-ok');
+
+      } catch (e) {
+        log('Error: ' + e.message, 'log-error');
+        setStatus('Error: ' + e.message, 'log-error');
+        document.getElementById('btn-connect').disabled = false;
+        if (pc) { pc.close(); pc = null; }
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Disconnect
+    // ------------------------------------------------------------------
+    function disconnect() {
+      if (pc) { pc.close(); pc = null; }
+      document.getElementById('video').srcObject = null;
+      setStatus('Disconnected');
+      document.getElementById('btn-connect').disabled    = false;
+      document.getElementById('btn-disconnect').disabled = true;
+    }
+  </script>
+</body>
+</html>

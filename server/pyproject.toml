@@ -1,0 +1,20 @@
+[tool.poetry]
+name        = "gamestream-server"
+version     = "0.1.0"
+description = "GameStream WebRTC signaling server — Stage 3"
+authors     = []
+readme      = "README.md"
+
+[tool.poetry.dependencies]
+python  = "^3.11"
+fastapi = "^0.115"
+uvicorn = { extras = ["standard"], version = "^0.34" }
+
+[build-system]
+requires      = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+# Quick install without Poetry:
+#   pip install fastapi "uvicorn[standard]"
+# Run:
+#   cd server && uvicorn main:app --host 0.0.0.0 --port 8765 --reload
