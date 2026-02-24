@@ -389,6 +389,131 @@ target_compile_options(webrtc_test PRIVATE
 )
 
 # ---------------------------------------------------------------------------
+# WebRTC integration (optional — set WEBRTC_ROOT and WEBRTC_BUILD_DIR to enable)
+#
+# Usage:
+#   cmake -DWEBRTC_ROOT=E:/dev/src -DWEBRTC_BUILD_DIR=E:/dev/src/out/Release ..
+# ---------------------------------------------------------------------------
+set(WEBRTC_ROOT     "" CACHE PATH "Path to WebRTC source tree (e.g. E:/dev/src)")
+set(WEBRTC_BUILD_DIR "" CACHE PATH "Path to WebRTC build output (e.g. E:/dev/src/out/Release)")
+
+if(WEBRTC_ROOT AND WEBRTC_BUILD_DIR)
+    if(NOT EXISTS "${WEBRTC_ROOT}/api/peer_connection_interface.h")
+        message(FATAL_ERROR "WEBRTC_ROOT is not a valid WebRTC source tree: ${WEBRTC_ROOT}")
+    endif()
+    if(NOT EXISTS "${WEBRTC_BUILD_DIR}/obj/webrtc.lib")
+        message(FATAL_ERROR "webrtc.lib not found at ${WEBRTC_BUILD_DIR}/obj/webrtc.lib")
+    endif()
+
+    # WebRTC sources for GameStream
+    set(WEBRTC_GS_SOURCES
+        src/webrtc/webrtc_host.cpp
+        src/webrtc/amf_webrtc_encoder.cpp
+        src/webrtc/capture_video_source.cpp
+    )
+    set(WEBRTC_GS_HEADERS
+        ${WEBRTC_ABSTRACT_HEADERS}
+        src/webrtc/amf_webrtc_encoder.h
+        src/webrtc/capture_video_source.h
+    )
+
+    # Windows system libs required by libwebrtc on Windows
+    set(WEBRTC_SYSTEM_LIBS
+        secur32.lib
+        winmm.lib
+        msdmo.lib
+        dmoguids.lib
+        wmcodecdspuuid.lib
+        amstrmid.lib
+        strmiids.lib
+        Iphlpapi.lib
+        dnsapi.lib
+        crypt32.lib
+    )
+
+    # ---------------------------------------------------------------------------
+    # webrtc_streaming — static lib: GameStream WebRTC pipeline
+    #   (webrtc_host.cpp + amf_webrtc_encoder.cpp + capture_video_source.cpp)
+    # ---------------------------------------------------------------------------
+    add_library(webrtc_streaming STATIC
+        ${WEBRTC_GS_SOURCES}
+        ${CAPTURE_SOURCES}
+        src/capture/wgc_capture.cpp
+        ${ENCODER_SOURCES}
+        ${WEBRTC_GS_HEADERS}
+        ${CAPTURE_HEADERS}
+        ${ENCODER_HEADERS}
+    )
+
+    # WebRTC system headers as SYSTEM to suppress /W4 warnings from them
+    target_include_directories(webrtc_streaming SYSTEM PRIVATE
+        ${WEBRTC_ROOT}
+        ${WEBRTC_ROOT}/third_party/abseil-cpp
+        ${WEBRTC_ROOT}/third_party/libyuv/include
+    )
+    target_include_directories(webrtc_streaming PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src   # for internal headers (src/webrtc/...)
+    )
+
+    target_link_libraries(webrtc_streaming PUBLIC
+        ${WIN_LIBS}
+        ${WINRT_LIBS}
+        spdlog::spdlog
+        ${WEBRTC_BUILD_DIR}/obj/webrtc.lib
+        ${WEBRTC_SYSTEM_LIBS}
+    )
+
+    target_compile_options(webrtc_streaming PRIVATE
+        /W4
+        /WX
+        /permissive-
+        /EHsc
+        /await:strict
+        /bigobj                # WebRTC headers produce large object files
+        /wd4100                # unreferenced formal parameter (WebRTC internals)
+        /wd4702                # unreachable code  (ABSL_ASSERT macros)
+    )
+
+    target_compile_definitions(webrtc_streaming PRIVATE
+        WEBRTC_WIN
+        ABSL_ALLOCATOR_NOTHROW=1
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+
+    # ---------------------------------------------------------------------------
+    # webrtc_test — Day 9 DataChannel smoke test (manual SDP copy-paste)
+    # ---------------------------------------------------------------------------
+    add_executable(webrtc_test
+        tools/webrtc_test.cpp
+    )
+    target_link_libraries(webrtc_test PRIVATE
+        webrtc_streaming
+        spdlog::spdlog
+    )
+    target_include_directories(webrtc_test SYSTEM PRIVATE
+        ${WEBRTC_ROOT}
+        ${WEBRTC_ROOT}/third_party/abseil-cpp
+    )
+    target_compile_options(webrtc_test PRIVATE
+        /W4 /WX /permissive- /EHsc /bigobj
+    )
+    target_compile_definitions(webrtc_test PRIVATE
+        WEBRTC_WIN WIN32_LEAN_AND_MEAN NOMINMAX
+    )
+
+    set_target_properties(webrtc_streaming webrtc_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    message(STATUS "  WebRTC: ENABLED")
+    message(STATUS "    Root:      ${WEBRTC_ROOT}")
+    message(STATUS "    Build dir: ${WEBRTC_BUILD_DIR}")
+else()
+    message(STATUS "  WebRTC: DISABLED (set -DWEBRTC_ROOT=... -DWEBRTC_BUILD_DIR=... to enable)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Common settings
 # ---------------------------------------------------------------------------
 set_target_properties(
