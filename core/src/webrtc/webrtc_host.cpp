@@ -24,6 +24,7 @@
 #include <api/media_stream_interface.h>
 #include <api/rtp_receiver_interface.h>
 #include <api/rtp_transceiver_interface.h>
+#include <api/rtp_parameters.h>
 #include <api/scoped_refptr.h>
 #include <api/make_ref_counted.h>
 #include <api/candidate.h>
@@ -51,29 +52,41 @@ namespace {
 
 PeerConnectionState map_pc_state(webrtc::PeerConnectionInterface::PeerConnectionState s) {
     switch (s) {
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kNew:
+            return PeerConnectionState::kNew;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kConnecting:
+            return PeerConnectionState::kConnecting;
         case webrtc::PeerConnectionInterface::PeerConnectionState::kConnected:
             return PeerConnectionState::kConnected;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kDisconnected:
+            return PeerConnectionState::kDisconnected;
         case webrtc::PeerConnectionInterface::PeerConnectionState::kFailed:
             return PeerConnectionState::kFailed;
         case webrtc::PeerConnectionInterface::PeerConnectionState::kClosed:
             return PeerConnectionState::kClosed;
-        default:
-            return PeerConnectionState::kConnecting;
     }
+    return PeerConnectionState::kConnecting;
 }
 
 PeerConnectionState map_pc_state(webrtc::PeerConnectionInterface::IceConnectionState s) {
     switch (s) {
+        case webrtc::PeerConnectionInterface::kIceConnectionNew:
+            return PeerConnectionState::kNew;
+        case webrtc::PeerConnectionInterface::kIceConnectionChecking:
+            return PeerConnectionState::kConnecting;
         case webrtc::PeerConnectionInterface::kIceConnectionConnected:
         case webrtc::PeerConnectionInterface::kIceConnectionCompleted:
             return PeerConnectionState::kConnected;
+        case webrtc::PeerConnectionInterface::kIceConnectionDisconnected:
+            return PeerConnectionState::kDisconnected;
         case webrtc::PeerConnectionInterface::kIceConnectionFailed:
             return PeerConnectionState::kFailed;
         case webrtc::PeerConnectionInterface::kIceConnectionClosed:
             return PeerConnectionState::kClosed;
-        default:
-            return PeerConnectionState::kConnecting;
+        case webrtc::PeerConnectionInterface::kIceConnectionMax:
+            break;
     }
+    return PeerConnectionState::kConnecting;
 }
 
 IceConnectionState map_ice_state(webrtc::PeerConnectionInterface::IceConnectionState s) {
@@ -185,6 +198,11 @@ private:
     [[nodiscard]] VoidResult create_peer_connection(
         const webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config);
     void create_input_data_channel();
+    void enable_d3d11_multithread(ID3D11Device* device) const;
+    void inject_encoder_factory(IEncoder* encoder, ID3D11Device* device);
+    [[nodiscard]] VoidResult add_video_transceiver(
+        const webrtc::scoped_refptr<webrtc::VideoTrackInterface>& video_track);
+    void cap_sender_framerate(const webrtc::scoped_refptr<webrtc::RtpSenderInterface>& sender) const;
 
     std::unique_ptr<webrtc::Thread> network_thread_;
     std::unique_ptr<webrtc::Thread> worker_thread_;
@@ -200,6 +218,7 @@ private:
     // first Create() during SDP negotiation.
     AMFVideoEncoderFactory* amf_encoder_factory_ = nullptr;
 
+    WebRTCConfig                     config_;
     IWebRTCObserver*                 observer_ = nullptr;
     std::atomic<bool>                initialized_{false};
     std::atomic<PeerConnectionState> state_{PeerConnectionState::kNew};
@@ -242,17 +261,17 @@ VoidResult WebRTCHostImpl::create_worker_threads() {
     network_thread_ = webrtc::Thread::CreateWithSocketServer();
     if (!network_thread_) return fail_initialize("Failed to create network_thread");
     network_thread_->SetName("network_thread", nullptr);
-    network_thread_->Start();
+    if (!network_thread_->Start()) return fail_initialize("Failed to start network_thread");
 
     worker_thread_ = webrtc::Thread::Create();
     if (!worker_thread_) return fail_initialize("Failed to create worker_thread");
     worker_thread_->SetName("worker_thread", nullptr);
-    worker_thread_->Start();
+    if (!worker_thread_->Start()) return fail_initialize("Failed to start worker_thread");
 
     signaling_thread_ = webrtc::Thread::Create();
     if (!signaling_thread_) return fail_initialize("Failed to create signaling_thread");
     signaling_thread_->SetName("signaling_thread", nullptr);
-    signaling_thread_->Start();
+    if (!signaling_thread_->Start()) return fail_initialize("Failed to start signaling_thread");
     return VoidResult();
 }
 
@@ -283,11 +302,12 @@ VoidResult WebRTCHostImpl::build_rtc_config(
     const WebRTCConfig& config,
     webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config) {
     rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-    // Keep STUN enabled. Restrict adapter enumeration, but still advertise
-    // the primary host candidate to avoid unnecessary srflx hairpin routing.
-    rtc_config.set_port_allocator_flags(
-        webrtc::PORTALLOCATOR_DISABLE_ADAPTER_ENUMERATION |
-        webrtc::PORTALLOCATOR_DISABLE_TCP);
+    // Disable TCP (UDP-only) for lower latency.
+    // Do NOT disable adapter enumeration: on machines with virtual adapters
+    // (Hyper-V, VPN — 198.18.0.x) disabling enumeration causes WebRTC to pick
+    // a virtual interface as the sole host candidate, which is unreachable from
+    // the browser.  Full enumeration lets ICE prefer the real LAN IP.
+    rtc_config.set_port_allocator_flags(webrtc::PORTALLOCATOR_DISABLE_TCP);
     if (config.ice_backup_candidate_pair_ping_interval_ms <= 0) {
         return fail_initialize("ice_backup_candidate_pair_ping_interval_ms must be > 0");
     }
@@ -301,18 +321,14 @@ VoidResult WebRTCHostImpl::build_rtc_config(
     rtc_config.ice_connection_receiving_timeout =
         config.ice_connection_receiving_timeout_ms;
 
-    if (!config.ice_servers.empty()) {
-        for (const auto& s : config.ice_servers) {
-            webrtc::PeerConnectionInterface::IceServer ice;
-            ice.uri      = s.uri;
-            ice.username = s.username;
-            ice.password = s.password;
-            rtc_config.servers.push_back(ice);
-        }
-    } else {
-        webrtc::PeerConnectionInterface::IceServer stun;
-        stun.uri = "stun:stun.l.google.com:19302";
-        rtc_config.servers.push_back(stun);
+    // Populate ICE servers from config.  Empty list = host candidates only
+    // (LAN/localhost).  For internet streaming, callers must supply STUN/TURN.
+    for (const auto& s : config.ice_servers) {
+        webrtc::PeerConnectionInterface::IceServer ice;
+        ice.uri      = s.uri;
+        ice.username = s.username;
+        ice.password = s.password;
+        rtc_config.servers.push_back(ice);
     }
     return VoidResult();
 }
@@ -334,7 +350,7 @@ void WebRTCHostImpl::create_input_data_channel() {
     webrtc::DataChannelInit dc_init;
     dc_init.ordered = true;
 
-    auto dc_res = pc_->CreateDataChannelOrError("gamestream_input", &dc_init);
+    auto dc_res = pc_->CreateDataChannelOrError(config_.input_channel_label, &dc_init);
     if (dc_res.ok()) {
         data_channel_ = dc_res.MoveValue();
         data_channel_->RegisterObserver(this);
@@ -343,10 +359,89 @@ void WebRTCHostImpl::create_input_data_channel() {
     }
 }
 
+void WebRTCHostImpl::enable_d3d11_multithread(ID3D11Device* device) const {
+    if (!device) {
+        return;
+    }
+    // Capture thread + encode thread share the immediate context: enable D3D11 MT protection.
+    Microsoft::WRL::ComPtr<ID3D11Multithread> mt;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Multithread),
+                                         reinterpret_cast<void**>(mt.GetAddressOf())))) {
+        mt->SetMultithreadProtected(TRUE);
+        spdlog::debug("[WebRTCHost] D3D11 multithread protection enabled");
+    }
+}
+
+void WebRTCHostImpl::inject_encoder_factory(IEncoder* encoder, ID3D11Device* device) {
+    if (amf_encoder_factory_) {
+        amf_encoder_factory_->set_encoder(encoder, device);
+        return;
+    }
+    spdlog::warn("[WebRTCHost] amf_encoder_factory_ is null — encoder not injected");
+}
+
+VoidResult WebRTCHostImpl::add_video_transceiver(
+    const webrtc::scoped_refptr<webrtc::VideoTrackInterface>& video_track) {
+    // Use AddTransceiver with kSendOnly to avoid kSendRecv intersection
+    // issues when no decoder factory is provided (sender-only host).
+    webrtc::RtpTransceiverInit trans_init;
+    trans_init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
+    trans_init.stream_ids = {"gamestream_stream"};
+    auto res = pc_->AddTransceiver(video_track, trans_init);
+    if (!res.ok()) {
+        return VoidResult::error("Failed to add video transceiver to PeerConnection");
+    }
+    cap_sender_framerate(res.value()->sender());
+    return VoidResult();
+}
+
+void WebRTCHostImpl::cap_sender_framerate(
+    const webrtc::scoped_refptr<webrtc::RtpSenderInterface>& sender) const {
+    webrtc::RtpParameters params = sender->GetParameters();
+    for (auto& enc : params.encodings) {
+        enc.max_framerate = config_.video_max_framerate;
+        enc.max_bitrate_bps = config_.video_max_bitrate_bps;
+        if (config_.video_min_bitrate_bps > 0) {
+            enc.min_bitrate_bps = config_.video_min_bitrate_bps;
+        }
+        if (config_.disable_video_adaptation) {
+            enc.scale_resolution_down_by = 1.0;
+        }
+    }
+    if (config_.disable_video_adaptation) {
+        params.degradation_preference = webrtc::DegradationPreference::DISABLED;
+    }
+    webrtc::RTCError set_err = sender->SetParameters(params);
+    if (!set_err.ok()) {
+        spdlog::warn("[WebRTCHost] SetParameters(video sender limits) failed: {}",
+                     set_err.message());
+        return;
+    }
+    spdlog::debug(
+        "[WebRTCHost] Sender params: max_fps={} max_bitrate={}bps min_bitrate={}bps adaptation={}",
+        config_.video_max_framerate,
+        config_.video_max_bitrate_bps,
+        config_.video_min_bitrate_bps,
+        config_.disable_video_adaptation ? "off" : "on");
+}
+
 VoidResult WebRTCHostImpl::initialize(const WebRTCConfig& config,
                                       IWebRTCObserver*    observer) {
     if (initialized_) return VoidResult::error("Already initialized");
     if (!observer) return VoidResult::error("Observer must not be null");
+    if (config.video_max_framerate <= 0) {
+        return VoidResult::error("video_max_framerate must be > 0");
+    }
+    if (config.video_max_bitrate_bps <= 0) {
+        return VoidResult::error("video_max_bitrate_bps must be > 0");
+    }
+    if (config.video_min_bitrate_bps < 0) {
+        return VoidResult::error("video_min_bitrate_bps must be >= 0");
+    }
+    if (config.video_min_bitrate_bps > config.video_max_bitrate_bps) {
+        return VoidResult::error("video_min_bitrate_bps must be <= video_max_bitrate_bps");
+    }
+    config_   = config;
     observer_ = observer;
 
     if (auto r = initialize_network_stack(); !r) return r;
@@ -381,9 +476,17 @@ VoidResult WebRTCHostImpl::create_offer() {
 VoidResult WebRTCHostImpl::set_remote_description(SessionDescription sdp) {
     if (!pc_) return VoidResult::error("Not initialized");
 
-    webrtc::SdpType type = (sdp.type == SessionDescriptionType::kOffer)
-                           ? webrtc::SdpType::kOffer
-                           : webrtc::SdpType::kAnswer;
+    webrtc::SdpType type;
+    switch (sdp.type) {
+        case SessionDescriptionType::kOffer:    type = webrtc::SdpType::kOffer;    break;
+        case SessionDescriptionType::kPrAnswer: type = webrtc::SdpType::kPrAnswer; break;
+        case SessionDescriptionType::kAnswer:   type = webrtc::SdpType::kAnswer;   break;
+        case SessionDescriptionType::kRollback: type = webrtc::SdpType::kRollback; break;
+        default:
+            return VoidResult::error(
+                std::string("Unknown SessionDescriptionType: ") +
+                std::to_string(static_cast<int>(sdp.type)));
+    }
     webrtc::SdpParseError parse_error;
     std::unique_ptr<webrtc::SessionDescriptionInterface> desc =
         webrtc::CreateSessionDescription(type, sdp.sdp, &parse_error);
@@ -413,34 +516,21 @@ VoidResult WebRTCHostImpl::add_ice_candidate(IceCandidateInfo candidate) {
             std::string("Failed to parse ICE candidate: ") + parse_error.description);
     }
 
-    pc_->AddIceCandidate(ice_candidate.get());
+    if (!pc_->AddIceCandidate(ice_candidate.get())) {
+        spdlog::error("[WebRTCHost] AddIceCandidate rejected — candidate may be invalid or ICE agent not ready");
+        return VoidResult::error("AddIceCandidate failed");
+    }
     return VoidResult();
 }
 
 VoidResult WebRTCHostImpl::add_video_track(IFrameCapture* capture, IEncoder* encoder) {
     if (!pc_ || !factory_) return VoidResult::error("Not initialized");
+    if (!capture) return VoidResult::error("capture must not be null");
+    if (!encoder) return VoidResult::error("encoder must not be null");
 
-    // Enable D3D11 multithread protection.
-    // CaptureVideoSource (capture thread) and AMFVideoEncoder (WebRTC encode thread)
-    // both use the device's immediate context.  SetMultithreadProtected serializes all
-    // D3D11 API calls via a per-device critical section — standard D3D11 mechanism.
     ID3D11Device* device = capture->get_device();
-    if (device) {
-        Microsoft::WRL::ComPtr<ID3D11Multithread> mt;
-        if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Multithread),
-                                             reinterpret_cast<void**>(mt.GetAddressOf())))) {
-            mt->SetMultithreadProtected(TRUE);
-            spdlog::debug("[WebRTCHost] D3D11 multithread protection enabled");
-        }
-    }
-
-    // Inject encoder + device into the factory before video track creation,
-    // ensuring Create() has valid pointers when WebRTC calls it during negotiation.
-    if (amf_encoder_factory_) {
-        amf_encoder_factory_->set_encoder(encoder, device);
-    } else {
-        spdlog::warn("[WebRTCHost] amf_encoder_factory_ is null — encoder not injected");
-    }
+    enable_d3d11_multithread(device);
+    inject_encoder_factory(encoder, device);
 
     {
         std::lock_guard<std::mutex> lock(encoder_mutex_);
@@ -452,34 +542,7 @@ VoidResult WebRTCHostImpl::add_video_track(IFrameCapture* capture, IEncoder* enc
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track(
         factory_->CreateVideoTrack(video_source_, "gamestream_video"));
 
-    // Use AddTransceiver with kSendOnly instead of AddTrack.
-    // AddTrack() creates a kSendRecv transceiver by default. In Unified Plan,
-    // GetVideoCodecsForOffer(kSendRecv) returns the intersection of send and
-    // recv codec lists. Since video_decoder_factory=nullptr, recv codecs are
-    // empty → intersection is empty → video m-section gets rejected (port 0).
-    // With kSendOnly, GetVideoCodecsForOffer returns video_send_codecs (H264).
-    webrtc::RtpTransceiverInit trans_init;
-    trans_init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
-    trans_init.stream_ids = {"gamestream_stream"};
-    auto res = pc_->AddTransceiver(video_track, trans_init);
-    if (!res.ok()) {
-        return VoidResult::error("Failed to add video transceiver to PeerConnection");
-    }
-
-    // Enforce 60 fps cap so WebRTC's congestion controller does not silently
-    // reduce the frame rate below the capture rate.
-    {
-        auto sender = res.value()->sender();
-        webrtc::RtpParameters params = sender->GetParameters();
-        for (auto& enc : params.encodings) {
-            enc.max_framerate = 60;
-        }
-        webrtc::RTCError set_err = sender->SetParameters(params);
-        if (!set_err.ok()) {
-            spdlog::warn("[WebRTCHost] SetParameters(max_framerate=60) failed: {}",
-                         set_err.message());
-        }
-    }
+    if (auto r = add_video_transceiver(video_track); !r) return r;
 
     video_source_->start();
     spdlog::info("[WebRTCHost] Video track added, capture started");

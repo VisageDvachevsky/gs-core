@@ -9,6 +9,8 @@
 
 #include <chrono>
 
+#include <timeapi.h>
+
 namespace gamestream {
 
 namespace {
@@ -16,6 +18,19 @@ namespace {
 constexpr int kTargetFps = 60;
 constexpr uint32_t kRtpTicksPerFrame = 90000u / kTargetFps;
 const auto kFrameInterval = std::chrono::microseconds(1'000'000 / kTargetFps);
+constexpr UINT kTimerResolutionMs = 1;
+
+bool set_timer_resolution(bool enable) {
+    const MMRESULT res = enable
+                         ? timeBeginPeriod(kTimerResolutionMs)
+                         : timeEndPeriod(kTimerResolutionMs);
+    if (res != TIMERR_NOERROR) {
+        spdlog::warn("[CaptureVideoSource] time{}Period({}) failed: {}",
+                     enable ? "Begin" : "End", kTimerResolutionMs, res);
+        return false;
+    }
+    return true;
+}
 
 void advance_pacer(uint32_t& rtp_timestamp,
                    std::chrono::steady_clock::time_point& next_emit_deadline) {
@@ -27,20 +42,14 @@ void advance_pacer(uint32_t& rtp_timestamp,
     }
 }
 
-webrtc::ColorSpace make_desktop_color_space() {
-    // Desktop content is sRGB (BT.709 primaries/transfer).  AMF H.264 encoder
-    // uses BT.709 limited-range matrix for HD (>=720p) input by default.
-    // Declaring the same here ensures the browser applies the correct YUV→RGB
-    // matrix via the RTP color-space header extension.
-    //
-    // NOTE: the intermediate I420 buffer (ARGBToI420 / I420ToARGB) uses
-    // libyuv BT.601, but that round-trip is cancelled before reaching AMF —
-    // it only affects the CPU-side scratch buffer, not the final H.264 stream.
-    return webrtc::ColorSpace(
-        webrtc::ColorSpace::PrimaryID::kBT709,
-        webrtc::ColorSpace::TransferID::kBT709,
-        webrtc::ColorSpace::MatrixID::kBT709,
-        webrtc::ColorSpace::RangeID::kLimited);
+webrtc::ColorSpace make_desktop_color_space(uint32_t width, uint32_t height) {
+    (void)width;
+    (void)height;
+    // libyuv's RGB->I420 conversion uses BT.601 coefficients.
+    return webrtc::ColorSpace(webrtc::ColorSpace::PrimaryID::kSMPTE170M,
+                              webrtc::ColorSpace::TransferID::kSMPTE170M,
+                              webrtc::ColorSpace::MatrixID::kSMPTE170M,
+                              webrtc::ColorSpace::RangeID::kLimited);
 }
 
 }  // namespace
@@ -60,6 +69,9 @@ void CaptureVideoSource::start() {
     if (running_.exchange(true)) {
         return;
     }
+    if (!timer_resolution_enabled_ && set_timer_resolution(true)) {
+        timer_resolution_enabled_ = true;
+    }
     thread_ = std::thread(&CaptureVideoSource::capture_loop, this);
 }
 
@@ -69,6 +81,10 @@ void CaptureVideoSource::stop() {
     }
     if (thread_.joinable()) {
         thread_.join();
+    }
+    if (timer_resolution_enabled_) {
+        set_timer_resolution(false);
+        timer_resolution_enabled_ = false;
     }
 }
 
@@ -171,6 +187,8 @@ bool CaptureVideoSource::convert_frame_to_i420(
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(d3d_context_->Map(staging_tex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        spdlog::error("[CaptureVideoSource] ID3D11DeviceContext::Map failed on staging texture "
+                      "({}x{})", frame.width, frame.height);
         return false;
     }
 
@@ -218,7 +236,9 @@ void CaptureVideoSource::capture_loop() {
     auto next_emit_deadline = std::chrono::steady_clock::now();
     uint32_t rtp_timestamp =
         static_cast<uint32_t>((webrtc::TimeMicros() * 90) / 1000);
-    const webrtc::ColorSpace desktop_color_space = make_desktop_color_space();
+    uint32_t cap_w = 0, cap_h = 0;
+    capture_->get_resolution(cap_w, cap_h);
+    const webrtc::ColorSpace desktop_color_space = make_desktop_color_space(cap_w, cap_h);
 
     bool invalid_result_logged = false;
     while (running_) {

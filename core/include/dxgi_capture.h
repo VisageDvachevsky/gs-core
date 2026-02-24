@@ -49,7 +49,15 @@ public:
 
 private:
     bool create_device(uint32_t adapter_index, bool find_amd);
+    bool find_adapter(uint32_t adapter_index, bool find_amd,
+                      Microsoft::WRL::ComPtr<IDXGIFactory1>& factory);
+    bool create_d3d11_device_from_adapter();
     bool create_duplication(uint32_t output_index);
+    bool open_output(uint32_t output_index, DXGI_OUTPUT_DESC& desc, std::string& name_utf8);
+    void log_output_desc(const DXGI_OUTPUT_DESC& desc, const std::string& name_utf8) const;
+    void update_output_size(const DXGI_OUTPUT_DESC& desc);
+    void log_refresh_rate() const;
+    bool create_output_duplication();
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;

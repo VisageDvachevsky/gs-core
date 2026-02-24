@@ -236,6 +236,14 @@ TEST(WebRTCConfigTest, DefaultIceConnectionReceivingTimeoutIs10000ms) {
     EXPECT_EQ(cfg.ice_connection_receiving_timeout_ms, 10000);
 }
 
+TEST(WebRTCConfigTest, DefaultVideoSenderLimitsAreReasonable) {
+    WebRTCConfig cfg;
+    EXPECT_EQ(cfg.video_max_framerate, 60);
+    EXPECT_EQ(cfg.video_min_bitrate_bps, 2'000'000);
+    EXPECT_EQ(cfg.video_max_bitrate_bps, 15'000'000);
+    EXPECT_FALSE(cfg.disable_video_adaptation);
+}
+
 TEST(WebRTCConfigTest, AddingIceServersWorks) {
     WebRTCConfig cfg;
     IceServer stun;
@@ -253,6 +261,19 @@ TEST(WebRTCConfigTest, IceTimeoutSettingsAreWritable) {
 
     EXPECT_EQ(cfg.ice_backup_candidate_pair_ping_interval_ms, 1500);
     EXPECT_EQ(cfg.ice_connection_receiving_timeout_ms, 12000);
+}
+
+TEST(WebRTCConfigTest, VideoSenderLimitsAreWritable) {
+    WebRTCConfig cfg;
+    cfg.video_max_framerate = 30;
+    cfg.video_min_bitrate_bps = 1'500'000;
+    cfg.video_max_bitrate_bps = 8'000'000;
+    cfg.disable_video_adaptation = true;
+
+    EXPECT_EQ(cfg.video_max_framerate, 30);
+    EXPECT_EQ(cfg.video_min_bitrate_bps, 1'500'000);
+    EXPECT_EQ(cfg.video_max_bitrate_bps, 8'000'000);
+    EXPECT_TRUE(cfg.disable_video_adaptation);
 }
 
 // ===========================================================================

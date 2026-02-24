@@ -86,6 +86,7 @@ public:
     webrtc::VideoEncoder::EncoderInfo GetEncoderInfo() const override;
 
 private:
+    // Drop stale frames to keep end-to-end latency bounded.
     static constexpr int64_t kMaxFrameAgeUs = 120'000;
     static constexpr uint64_t kTransientWarnEveryN = 120;
 

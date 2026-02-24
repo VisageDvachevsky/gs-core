@@ -19,6 +19,7 @@
 #include <core/Surface.h>
 #include <core/Buffer.h>
 #include <core/Data.h>
+#include <components/ColorSpace.h>
 #include <components/Component.h>
 #include <components/VideoEncoderVCE.h>
 
@@ -47,11 +48,25 @@ public:
     bool is_initialized_ = false;
     steady_clock::time_point start_time_;
 
-    // Helpers
+    // Initialization helpers
     [[nodiscard]] VoidResult load_amf_dll();
     [[nodiscard]] VoidResult create_context(ID3D11Device* device);
     [[nodiscard]] VoidResult create_encoder();
     [[nodiscard]] VoidResult configure_encoder();
+    [[nodiscard]] VoidResult apply_color_profile();
+    [[nodiscard]] VoidResult apply_usage_profile();
+    [[nodiscard]] VoidResult apply_rate_control();
+    [[nodiscard]] VoidResult apply_framerate();
+    [[nodiscard]] VoidResult init_encoder_surface();
+    [[nodiscard]] VoidResult set_property_int(const wchar_t* prop, amf_int64 val);
+    [[nodiscard]] VoidResult set_property_int_optional(const wchar_t* prop, amf_int64 val);
+    static std::string narrow_prop_name(const wchar_t* w);
+
+    // encode() sub-steps
+    void apply_keyframe_markers(amf::AMFSurfacePtr& surface);
+    [[nodiscard]] Result<amf::AMFDataPtr> poll_encoded_output();
+    [[nodiscard]] Result<EncodedFrame> build_encoded_frame(
+        amf::AMFDataPtr& data, uint64_t pts_us, double encode_ms);
 
     void update_stats(double encode_ms, size_t byte_count, bool is_kf);
 };
@@ -117,78 +132,123 @@ VoidResult AMFEncoderImpl::create_encoder() {
     return {};
 }
 
-VoidResult AMFEncoderImpl::configure_encoder() {
-    // Type-safe property setter: converts any integral/enum/bool value to amf_int64
-    // and includes the AMF property name (an ASCII-range wchar_t* constant) in the
-    // error message.  Template lambda (C++20) avoids the old AMF_SET macro.
-    auto narrow_name = [](const wchar_t* w) -> std::string {
-        // AMF property name constants are ASCII-range wide strings — convert safely.
-        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-        if (len <= 0) return {};
-        std::string result(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, result.data(), len, nullptr, nullptr);
-        return result;
-    };
-    auto set = [&]<typename V>(const wchar_t* prop, V val) -> VoidResult {
-        AMF_RESULT r = encoder_->SetProperty(prop, static_cast<amf_int64>(val));
-        if (r != AMF_OK) {
-            return VoidResult::error(std::format(
-                "SetProperty({}) failed: 0x{:08X}",
-                narrow_name(prop), static_cast<uint32_t>(r)));
-        }
+std::string AMFEncoderImpl::narrow_prop_name(const wchar_t* w) {
+    if (!w || *w == L'\0') {
         return {};
-    };
+    }
 
-    // Must be set FIRST — configures all other defaults
-    if (auto r = set(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY); !r) return r;
+    const int len_with_nul = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (len_with_nul <= 1) {
+        return {};
+    }
 
-    // H.264 Baseline profile — no CABAC, no B-frames, widest decoder support
-    if (auto r = set(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_BASELINE); !r) return r;
+    std::string result(static_cast<size_t>(len_with_nul), '\0');
+    const int written = WideCharToMultiByte(CP_UTF8, 0, w, -1, result.data(),
+                                            len_with_nul, nullptr, nullptr);
+    if (written <= 0) {
+        return {};
+    }
+    result.resize(static_cast<size_t>(written - 1));
+    return result;
+}
 
-    // No B-frames: minimize encode latency (B-frames add 1+ frame delay)
-    if (auto r = set(AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0); !r) return r;
+VoidResult AMFEncoderImpl::set_property_int(const wchar_t* prop, amf_int64 val) {
+    AMF_RESULT r = encoder_->SetProperty(prop, val);
+    if (r != AMF_OK) {
+        return VoidResult::error(std::format(
+            "SetProperty({}) failed: 0x{:08X}",
+            narrow_prop_name(prop), static_cast<uint32_t>(r)));
+    }
+    return {};
+}
 
-    // Minimum reference frames: reduces encoder buffering latency
-    if (auto r = set(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 1); !r) return r;
+VoidResult AMFEncoderImpl::set_property_int_optional(const wchar_t* prop, amf_int64 val) {
+    AMF_RESULT r = encoder_->SetProperty(prop, val);
+    if (r == AMF_OK) {
+        return {};
+    }
+    spdlog::debug("[AMF] SetProperty({}) skipped: 0x{:08X}",
+                  narrow_prop_name(prop), static_cast<uint32_t>(r));
+    return {};
+}
 
-    // Speed preset: lower quality, much lower latency (< 6 ms target)
-    if (auto r = set(AMF_VIDEO_ENCODER_QUALITY_PRESET, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED); !r) return r;
+VoidResult AMFEncoderImpl::apply_usage_profile() {
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_USAGE,
+                                  AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY); !r) return r;
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_PROFILE,
+                                  AMF_VIDEO_ENCODER_PROFILE_BASELINE); !r) return r;
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0); !r) return r;
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 1); !r) return r;
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_QUALITY_PRESET,
+                                  AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED); !r) return r;
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true); !r) return r;
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_CABAC_ENABLE,
+                                  AMF_VIDEO_ENCODER_UNDEFINED); !r) return r;
+    return {};
+}
 
-    // Internal low-latency mode (POC mode 2)
-    if (auto r = set(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true); !r) return r;
+VoidResult AMFEncoderImpl::apply_color_profile() {
+    // libyuv's RGB->I420 conversion uses BT.601 coefficients. Signal BT.601
+    // and limited (studio) range so the receiver interprets the stream correctly.
+    const amf_int64 profile = AMF_VIDEO_CONVERTER_COLOR_PROFILE_601;
+    const amf_int64 primaries = AMF_COLOR_PRIMARIES_SMPTE170M;
+    const amf_int64 transfer = AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE170M;
+    const amf_int64 matrix = AMF_COLOR_MATRIX_COEFF_BT_601;
 
-    // CBR: constant bitrate — predictable network load for streaming
-    if (auto r = set(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_INPUT_FULL_RANGE_COLOR, false); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, false); !r) return r;
 
-    // Bitrate from config
-    if (auto r = set(AMF_VIDEO_ENCODER_TARGET_BITRATE, config_.bitrate_bps); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_INPUT_COLOR_PROFILE, profile); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE, profile); !r) return r;
 
-    // Baseline profile uses CAVLC (not CABAC) — required for compatibility
-    if (auto r = set(AMF_VIDEO_ENCODER_CABAC_ENABLE, AMF_VIDEO_ENCODER_UNDEFINED); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_INPUT_COLOR_PRIMARIES, primaries); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES, primaries); !r) return r;
 
-    // Frame rate — AMFRate requires a different SetProperty overload (not amf_int64)
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_INPUT_TRANSFER_CHARACTERISTIC, transfer); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC, transfer); !r) return r;
+
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_INPUT_MATRIX_COEFF, matrix); !r) return r;
+    if (auto r = set_property_int_optional(AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF, matrix); !r) return r;
+
+    return {};
+}
+
+VoidResult AMFEncoderImpl::apply_rate_control() {
+    if (auto r = set_property_int(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+                                  AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR); !r) return r;
+    return set_property_int(AMF_VIDEO_ENCODER_TARGET_BITRATE, config_.bitrate_bps);
+}
+
+VoidResult AMFEncoderImpl::apply_framerate() {
     AMFRate fps_rate = AMFConstructRate(config_.fps, 1);
     AMF_RESULT res = encoder_->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, fps_rate);
     if (res != AMF_OK) {
         return VoidResult::error(std::format(
             "SetProperty(FRAMERATE) failed: 0x{:08X}", static_cast<uint32_t>(res)));
     }
-
-    // IDR every 5 seconds: allows new viewer to start decoding without waiting too long
     const amf_int64 idr_period = static_cast<amf_int64>(config_.fps) * 5;
-    if (auto r = set(AMF_VIDEO_ENCODER_IDR_PERIOD, idr_period); !r) return r;
+    return set_property_int(AMF_VIDEO_ENCODER_IDR_PERIOD, idr_period);
+}
 
-    // Apply configuration and allocate GPU resources
-    res = encoder_->Init(
+VoidResult AMFEncoderImpl::init_encoder_surface() {
+    AMF_RESULT res = encoder_->Init(
         amf::AMF_SURFACE_BGRA,
         static_cast<amf_int32>(config_.width),
         static_cast<amf_int32>(config_.height));
-
     if (res != AMF_OK) {
         return VoidResult::error(std::format(
             "AMFComponent::Init(BGRA, {}x{}) failed: 0x{:08X}",
             config_.width, config_.height, static_cast<uint32_t>(res)));
     }
+    return {};
+}
+
+VoidResult AMFEncoderImpl::configure_encoder() {
+    if (auto r = apply_usage_profile(); !r) return r;
+    if (auto r = apply_color_profile(); !r) return r;
+    if (auto r = apply_rate_control(); !r) return r;
+    if (auto r = apply_framerate(); !r) return r;
+    if (auto r = init_encoder_surface(); !r) return r;
 
     spdlog::info("[AMF] Encoder configured: {}x{}@{} fps, {} Mbps, Baseline, Ultra-Low-Latency",
                  config_.width, config_.height, config_.fps,
@@ -242,6 +302,78 @@ AMFEncoder::~AMFEncoder() {
     spdlog::debug("[AMF] Encoder destroyed");
 }
 
+// ---------------------------------------------------------------------------
+// AMFEncoderImpl — encode() sub-steps
+// ---------------------------------------------------------------------------
+
+void AMFEncoderImpl::apply_keyframe_markers(amf::AMFSurfacePtr& surface) {
+    // Force IDR if requested (e.g. from DataChannel PLI signal).
+    if (!keyframe_requested_.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    AMF_RESULT res = surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
+                                          static_cast<amf_int64>(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR));
+    if (res != AMF_OK) {
+        spdlog::warn("[AMF] SetProperty(FORCE_PICTURE_TYPE=IDR) failed: 0x{:08X}",
+                     static_cast<uint32_t>(res));
+    }
+    // Include SPS/PPS so decoders can recover even if they missed earlier parameter sets.
+    if (surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true) != AMF_OK) {
+        spdlog::warn("[AMF] SetProperty(INSERT_SPS=true) failed");
+    }
+    if (surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true) != AMF_OK) {
+        spdlog::warn("[AMF] SetProperty(INSERT_PPS=true) failed");
+    }
+}
+
+Result<amf::AMFDataPtr> AMFEncoderImpl::poll_encoded_output() {
+    amf::AMFDataPtr output_data;
+    constexpr int kMaxPollAttempts = 100;
+    for (int attempt = 0; attempt < kMaxPollAttempts; ++attempt) {
+        AMF_RESULT res = encoder_->QueryOutput(&output_data);
+        if (res == AMF_OK && output_data) {
+            return output_data;
+        }
+        if (res == AMF_REPEAT || (res == AMF_OK && !output_data)) {
+            Sleep(0);  // yield to OS scheduler without sleeping
+            continue;
+        }
+        return Result<amf::AMFDataPtr>::error(
+            std::format("QueryOutput failed: 0x{:08X}", static_cast<uint32_t>(res)));
+    }
+    return Result<amf::AMFDataPtr>::error("QueryOutput: no output after max poll attempts");
+}
+
+Result<EncodedFrame> AMFEncoderImpl::build_encoded_frame(
+    amf::AMFDataPtr& data, uint64_t pts_us, double encode_ms) {
+    amf::AMFBufferPtr buf(data);
+    if (!buf) {
+        return Result<EncodedFrame>::error("QueryOutput: output is not an AMFBuffer");
+    }
+    const void*  raw  = buf->GetNative();
+    const size_t size = buf->GetSize();
+    if (!raw || size == 0) {
+        return Result<EncodedFrame>::error("QueryOutput: empty bitstream buffer");
+    }
+
+    amf_int64 output_type = AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_P;
+    buf->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &output_type);
+    const bool is_kf = (output_type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR);
+
+    EncodedFrame encoded;
+    encoded.data.assign(static_cast<const uint8_t*>(raw),
+                        static_cast<const uint8_t*>(raw) + size);
+    encoded.is_keyframe = is_kf;
+    encoded.pts_us      = pts_us;
+
+    update_stats(encode_ms, size, is_kf);
+    spdlog::trace("[AMF] {} frame: {} bytes, {:.2f} ms",
+                  is_kf ? "IDR" : "P", size, encode_ms);
+    return encoded;
+}
+
+// ---------------------------------------------------------------------------
+
 VoidResult AMFEncoder::initialize(ID3D11Device* device, const EncoderConfig& config) {
     if (!device) {
         return VoidResult::error("AMFEncoder::initialize: device must not be nullptr");
@@ -271,48 +403,24 @@ Result<EncodedFrame> AMFEncoder::encode(const CaptureFrame& frame) {
 
     auto t0 = steady_clock::now();
 
-    // --- Step 1: wrap D3D11 texture in an AMF surface (zero-copy) ---
+    // Step 1: wrap D3D11 texture in an AMF surface (zero-copy)
     amf::AMFSurfacePtr surface;
     AMF_RESULT res = impl_->context_->CreateSurfaceFromDX11Native(
         frame.texture.Get(), &surface, nullptr);
-
     if (res != AMF_OK) {
         return Result<EncodedFrame>::error(std::format(
             "CreateSurfaceFromDX11Native failed: 0x{:08X}", static_cast<uint32_t>(res)));
     }
 
-    // --- Step 2: set presentation timestamp (AMF uses 100-ns units) ---
+    // Step 2: set presentation timestamp (AMF uses 100-ns units)
     surface->SetPts(static_cast<amf_pts>(frame.timestamp_us) * 10);
 
-    // --- Step 3: force IDR if requested (e.g. from DataChannel PLI signal) ---
-    if (impl_->keyframe_requested_.exchange(false, std::memory_order_acq_rel)) {
-        res = surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
-                                   static_cast<amf_int64>(AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR));
-        if (res != AMF_OK) {
-            spdlog::warn("[AMF] SetProperty(FORCE_PICTURE_TYPE=IDR) failed: 0x{:08X}",
-                         static_cast<uint32_t>(res));
-            // Non-fatal: continue without force IDR this frame
-        }
-        // For decoder recovery in WebRTC, include SPS/PPS with forced IDR frames.
-        // Some decoders cannot recover from an out-of-sync state if IDR arrives
-        // without parameter sets.
-        AMF_RESULT sps_res = surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
-        if (sps_res != AMF_OK) {
-            spdlog::warn("[AMF] SetProperty(INSERT_SPS=true) failed: 0x{:08X}",
-                         static_cast<uint32_t>(sps_res));
-        }
-        AMF_RESULT pps_res = surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
-        if (pps_res != AMF_OK) {
-            spdlog::warn("[AMF] SetProperty(INSERT_PPS=true) failed: 0x{:08X}",
-                         static_cast<uint32_t>(pps_res));
-        }
-    }
+    // Step 3: mark as IDR if a keyframe was requested
+    impl_->apply_keyframe_markers(surface);
 
-    // --- Step 4: submit frame to encoder pipeline ---
+    // Step 4: submit frame to the encoder pipeline
     res = impl_->encoder_->SubmitInput(surface);
     if (res == AMF_INPUT_FULL) {
-        // Should not happen in ultra-low-latency mode with 1 ref frame,
-        // but handle defensively: drain pending output then retry.
         spdlog::warn("[AMF] SubmitInput returned INPUT_FULL — draining");
         return Result<EncodedFrame>::error("encoder input full, retry next frame");
     }
@@ -321,68 +429,15 @@ Result<EncodedFrame> AMFEncoder::encode(const CaptureFrame& frame) {
             "SubmitInput failed: 0x{:08X}", static_cast<uint32_t>(res)));
     }
 
-    // --- Step 5: poll for encoded output (ultra-low-latency = 1 output per input) ---
-    amf::AMFDataPtr output_data;
-    constexpr int kMaxPollAttempts = 100;
+    // Step 5: poll for the encoded NAL unit
+    auto poll_res = impl_->poll_encoded_output();
+    if (!poll_res) return Result<EncodedFrame>::error(poll_res.error());
 
-    for (int attempt = 0; attempt < kMaxPollAttempts; ++attempt) {
-        res = impl_->encoder_->QueryOutput(&output_data);
-
-        if (res == AMF_OK && output_data) {
-            break;  // Got a frame
-        }
-
-        if (res == AMF_REPEAT || (res == AMF_OK && !output_data)) {
-            // Not ready yet — yield and retry
-            Sleep(0);  // yield to OS scheduler without sleeping
-            continue;
-        }
-
-        return Result<EncodedFrame>::error(std::format(
-            "QueryOutput failed: 0x{:08X}", static_cast<uint32_t>(res)));
-    }
-
-    if (!output_data) {
-        return Result<EncodedFrame>::error("QueryOutput: no output after max poll attempts");
-    }
-
-    // --- Step 6: extract bitstream from the output AMFBuffer ---
-    amf::AMFBufferPtr output_buffer(output_data);
-    if (!output_buffer) {
-        return Result<EncodedFrame>::error("QueryOutput: output is not an AMFBuffer");
-    }
-
-    const void*  raw_data  = output_buffer->GetNative();
-    const size_t data_size = output_buffer->GetSize();
-
-    if (!raw_data || data_size == 0) {
-        return Result<EncodedFrame>::error("QueryOutput: empty bitstream buffer");
-    }
-
-    // --- Step 7: check frame type ---
-    amf_int64 output_type = AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_P;
-    output_buffer->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &output_type);
-    const bool is_keyframe = (output_type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR);
-
-    // --- Step 8: copy bitstream to output frame ---
-    EncodedFrame encoded;
-    encoded.data.assign(
-        static_cast<const uint8_t*>(raw_data),
-        static_cast<const uint8_t*>(raw_data) + data_size);
-    encoded.is_keyframe = is_keyframe;
-    encoded.pts_us      = frame.timestamp_us;
-
-    // --- Step 9: update stats ---
+    // Steps 6-9: extract bitstream, fill EncodedFrame, update stats
     auto t1 = steady_clock::now();
-    double encode_ms = duration<double, std::milli>(t1 - t0).count();
-    impl_->update_stats(encode_ms, data_size, is_keyframe);
-
-    // Per-frame TRACE log (compiled out in Release)
-    spdlog::trace("[AMF] {} frame: {} bytes, {:.2f} ms",
-                  is_keyframe ? "IDR" : "P",
-                  data_size, encode_ms);
-
-    return encoded;
+    const double encode_ms = duration<double, std::milli>(t1 - t0).count();
+    amf::AMFDataPtr output_data = poll_res.value();
+    return impl_->build_encoded_frame(output_data, frame.timestamp_us, encode_ms);
 }
 
 void AMFEncoder::request_keyframe() {

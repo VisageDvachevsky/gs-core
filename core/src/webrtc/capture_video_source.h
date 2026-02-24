@@ -32,7 +32,8 @@ public:
 
     SourceState state() const override;
     bool remote()       const override { return false; }
-    bool is_screencast() const override { return true; }
+    // Treat as real-time video to minimize buffering on the receiver.
+    bool is_screencast() const override { return false; }
     std::optional<bool> needs_denoising() const override { return false; }
 
 private:
@@ -66,6 +67,7 @@ private:
 
     std::atomic<bool> running_{false};
     std::thread       thread_;
+    bool              timer_resolution_enabled_ = false;
 };
 
 } // namespace gamestream

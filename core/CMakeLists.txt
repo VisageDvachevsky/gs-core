@@ -8,8 +8,27 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Windows SDK version (we have 10.0.26100.0)
 set(CMAKE_SYSTEM_VERSION "10.0.26100.0")
 
-# Windows SDK paths for WinRT
-set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10")
+# Windows SDK paths for WinRT.
+# Auto-detected from the WindowsSdkDir environment variable (set by vcvarsall.bat).
+# Override by passing -DWINDOWS_SDK_PATH=<path> to CMake.
+set(WINDOWS_SDK_PATH "" CACHE PATH
+    "Windows Kits/10 root (auto-detected from \$ENV{WindowsSdkDir} when empty)")
+if(NOT WINDOWS_SDK_PATH)
+    if(DEFINED ENV{WindowsSdkDir})
+        # Set by vcvarsall.bat / VS Developer Command Prompt
+        file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}" _detected_sdk_path)
+        set(WINDOWS_SDK_PATH "${_detected_sdk_path}" CACHE PATH
+            "Windows Kits/10 root" FORCE)
+    elseif(EXISTS "C:/Program Files (x86)/Windows Kits/10")
+        # Standard x64 host install location
+        set(WINDOWS_SDK_PATH "C:/Program Files (x86)/Windows Kits/10" CACHE PATH
+            "Windows Kits/10 root" FORCE)
+    else()
+        message(FATAL_ERROR
+            "Windows SDK path not found.\n"
+            "Pass -DWINDOWS_SDK_PATH=<C:/Program Files (x86)/Windows Kits/10> to CMake.")
+    endif()
+endif()
 set(WINDOWS_SDK_VERSION "10.0.26100.0")
 
 # ---------------------------------------------------------------------------
@@ -46,10 +65,12 @@ FetchContent_MakeAvailable(googletest)
 
 enable_testing()
 
-# AMF SDK paths
-set(AMF_SDK_DIR "C:/dev/AMF" CACHE PATH "Path to AMF SDK")
-if(NOT EXISTS ${AMF_SDK_DIR})
-    message(FATAL_ERROR "AMF SDK not found at ${AMF_SDK_DIR}. Install it or override AMF_SDK_DIR.")
+# AMF SDK paths (no default — must be provided by the developer)
+set(AMF_SDK_DIR "" CACHE PATH "Path to AMF SDK (e.g. C:/dev/AMF)")
+if(NOT AMF_SDK_DIR OR NOT EXISTS "${AMF_SDK_DIR}")
+    message(FATAL_ERROR
+        "AMF SDK not found.\n"
+        "Pass -DAMF_SDK_DIR=<path> pointing to the AMF SDK root (contains amf/public/include).")
 endif()
 
 # Include directories (applied globally; unit_tests uses include/ and Windows SDK)
@@ -272,9 +293,17 @@ target_compile_options(unit_tests PRIVATE
 
 add_test(NAME GameStreamUnitTests COMMAND unit_tests)
 
-# WebRTC paths
-set(WEBRTC_ROOT "E:/dev/src" CACHE PATH "Path to WebRTC source")
-set(WEBRTC_BUILD_DIR "${WEBRTC_ROOT}/out/Release" CACHE PATH "Path to WebRTC build output")
+# WebRTC paths (no defaults — must be provided by the developer)
+set(WEBRTC_ROOT     ""  CACHE PATH "Path to WebRTC source (e.g. E:/dev/src)")
+set(WEBRTC_BUILD_DIR "" CACHE PATH "Path to WebRTC build output (e.g. \${WEBRTC_ROOT}/out/Release)")
+if(NOT WEBRTC_ROOT OR NOT EXISTS "${WEBRTC_ROOT}")
+    message(FATAL_ERROR
+        "WebRTC source not found.\n"
+        "Pass -DWEBRTC_ROOT=<path> pointing to the depot_tools checkout of WebRTC.")
+endif()
+if(NOT WEBRTC_BUILD_DIR)
+    set(WEBRTC_BUILD_DIR "${WEBRTC_ROOT}/out/Release")
+endif()
 
 # WebRTC defines
 add_definitions(

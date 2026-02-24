@@ -413,7 +413,7 @@ int main(int argc, char* argv[]) {
     const char*   server_host = (argc > 1) ? argv[1] : "localhost";
     const auto    server_port = static_cast<INTERNET_PORT>(
                                     (argc > 2) ? std::stoul(argv[2]) : 8765u);
-    const char*   session_id  = (argc > 3) ? argv[3] : "test-session";
+    const char*   session_id  = (argc > 3) ? argv[3] : "a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5";
     const uint32_t output_index = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 0u;
 
     spdlog::info("[main] server={}:{}  session={}  output_index={}",
@@ -440,7 +440,7 @@ int main(int argc, char* argv[]) {
     enc_cfg.width       = width;
     enc_cfg.height      = height;
     enc_cfg.fps         = 60;
-    enc_cfg.bitrate_bps = 15'000'000;
+    enc_cfg.bitrate_bps = 30'000'000;
     if (auto r = encoder.initialize(capture.get_device(), enc_cfg); !r) {
         spdlog::error("[main] AMF encoder init: {}", r.error());
         return 1;
@@ -449,12 +449,9 @@ int main(int argc, char* argv[]) {
     // ---- 3. WebRTCHost ----
     StreamingObserver observer;
     WebRTCHost        host;
-    WebRTCConfig      cfg;
-    {
-        IceServer stun;
-        stun.uri = "stun:stun.l.google.com:19302";
-        cfg.ice_servers.push_back(std::move(stun));
-    }
+    // No STUN for LAN/localhost testing — host candidates are sufficient.
+    // For internet streaming, populate cfg.ice_servers with STUN/TURN URIs.
+    WebRTCConfig cfg;
     if (auto r = host.initialize(cfg, &observer); !r) {
         spdlog::error("[main] WebRTCHost init: {}", r.error());
         return 1;
