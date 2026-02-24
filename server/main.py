@@ -57,8 +57,8 @@ def _validate_session_id(session_id: str) -> None:
 
 @dataclass
 class Session:
-    offer:        dict | None = None
-    answer:       dict | None = None
+    offer:        dict[str, str] | None = None
+    answer:       dict[str, str] | None = None
     offer_event:  asyncio.Event = field(default_factory=asyncio.Event)
     answer_event: asyncio.Event = field(default_factory=asyncio.Event)
     created_at:   float = field(default_factory=time.monotonic)
@@ -92,7 +92,7 @@ def _get_session(session_id: str) -> Session:
 # ---------------------------------------------------------------------------
 
 @app.post("/api/session/{session_id}/offer")
-async def post_offer(session_id: str, request: Request) -> dict:
+async def post_offer(session_id: str, request: Request) -> dict[str, str]:
     """C++ host submits an SDP offer.  Resets the session if called again."""
     _validate_session_id(session_id)
     body = await request.json()
@@ -119,13 +119,15 @@ async def get_offer(session_id: str) -> JSONResponse:
     s = _get_session(session_id)
     try:
         await asyncio.wait_for(s.offer_event.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="Offer not available within 30 s")
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=408, detail="Offer not available within 30 s"
+        ) from exc
     return JSONResponse(s.offer)
 
 
 @app.post("/api/session/{session_id}/answer")
-async def post_answer(session_id: str, request: Request) -> dict:
+async def post_answer(session_id: str, request: Request) -> dict[str, str]:
     """Browser submits its SDP answer."""
     _validate_session_id(session_id)
     body = await request.json()
@@ -150,7 +152,7 @@ async def get_answer(session_id: str) -> JSONResponse:
 
 
 @app.post("/api/client/stats")
-async def post_client_stats(request: Request) -> dict:
+async def post_client_stats(request: Request) -> dict[str, str]:
     """Browser submits periodic stats snapshots (JSONL)."""
     try:
         body = await request.json()
