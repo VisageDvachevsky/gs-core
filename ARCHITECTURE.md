@@ -1,6 +1,6 @@
 # 🧠 GameStream — Архитектура системы
 
-**Status**: Development (PHASE 3: WebRTC & Signaling)
+**Status**: Development (PHASE 4: Input Pipeline)
 **Target**: Death Stranding @ 1080p60 WebRTC with <80ms latency
 
 ---
@@ -85,9 +85,9 @@ SERVER (Your PC)
 |-------|------|------|--------|
 | 1 | Local DXGI + AMF capture PoC | 1–2 weeks | ✅ Done |
 | 2 | WebRTC integration (localhost) | 1–2 weeks | ✅ Done |
-| 3 | Signaling server (internet ready) | 3–5 days | 🟡 In Progress |
-| 4 | Web client UI | 3–5 days | 📋 Later |
-| 5 | Optimization + monitoring | 2+ weeks | 📋 Later |
+| 3 | Signaling server (internet ready) | 3–5 days | ✅ Done |
+| 4 | Input pipeline (DataChannel + SendInput) | 3–5 days | 🟡 In Progress |
+| 5 | Web client UI + optimization + monitoring | 2+ weeks | 📋 Later |
 
 ---
 

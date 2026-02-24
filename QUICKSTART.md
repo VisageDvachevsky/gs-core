@@ -53,11 +53,11 @@ Input echo (клик → реакция на экране):
 
 ## 📋 План (5 фаз)
 
-1. **PHASE 1**: Local DXGI + AMF PoC (1–2 нед) 🟡 Ready
-2. **PHASE 2**: WebRTC locally (1–2 нед) 📋 Next
-3. **PHASE 3**: Signaling server (3–5 дн) 📋 Later
-4. **PHASE 4**: Web client (3–5 дн) 📋 Later
-5. **PHASE 5**: Optimization + monitoring (2+ нед) 📋 Later
+1. **PHASE 1**: Local DXGI + AMF PoC (1–2 нед) ✅ Done
+2. **PHASE 2**: WebRTC locally (1–2 нед) ✅ Done
+3. **PHASE 3**: Signaling server (3–5 дн) ✅ Done
+4. **PHASE 4**: Input pipeline (3–5 дн) 🟡 In Progress
+5. **PHASE 5**: Web client + optimization + monitoring (2+ нед) 📋 Later
 
 ---
 
@@ -94,5 +94,5 @@ Input echo (клик → реакция на экране):
 
 ---
 
-**Status**: ✅ Архитектура готова
-**Следующий шаг**: Читай ARCHITECTURE.md → начни PHASE 1
+**Status**: 🟡 PHASE 4 in progress
+**Следующий шаг**: Реализовать input pipeline через DataChannel + SendInput.
