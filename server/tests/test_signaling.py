@@ -8,11 +8,12 @@ Run:
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
-import main
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from main import app
+import main
+
+app = main.app
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -78,19 +79,19 @@ async def test_post_offer_rejects_invalid_session_id(
 
 @pytest.mark.anyio
 async def test_get_offer_rejects_invalid_session_id(client: AsyncClient) -> None:
-    resp = await client.get(f"/api/session/not-a-uuid/offer")
+    resp = await client.get("/api/session/not-a-uuid/offer")
     assert resp.status_code == 400
 
 
 @pytest.mark.anyio
 async def test_post_answer_rejects_invalid_session_id(client: AsyncClient) -> None:
-    resp = await client.post(f"/api/session/not-a-uuid/answer", json=ANSWER_BODY)
+    resp = await client.post("/api/session/not-a-uuid/answer", json=ANSWER_BODY)
     assert resp.status_code == 400
 
 
 @pytest.mark.anyio
 async def test_get_answer_rejects_invalid_session_id(client: AsyncClient) -> None:
-    resp = await client.get(f"/api/session/not-a-uuid/answer")
+    resp = await client.get("/api/session/not-a-uuid/answer")
     assert resp.status_code == 400
 
 

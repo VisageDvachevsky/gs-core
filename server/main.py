@@ -119,8 +119,10 @@ async def get_offer(session_id: str) -> JSONResponse:
     s = _get_session(session_id)
     try:
         await asyncio.wait_for(s.offer_event.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="Offer not available within 30 s")
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=408, detail="Offer not available within 30 s"
+        ) from exc
     return JSONResponse(s.offer)
 
 
