@@ -18,7 +18,8 @@
 ///   assert in value() const &  — ConstLvalueValueOnErrorState (death)
 ///   value() &&                 — ValueRvalueMovesOut
 ///   assert in value() &&       — RvalueValueOnErrorState (death)
-///   error() const accessor     — ErrorMessageAccessor, EmptyErrorString, ErrorThrowsOnSuccess
+///   value_if()/error_if()      — ValueIf*, ErrorIf*
+///   error() const accessor     — ErrorMessageAccessor, EmptyErrorString, ErrorOnSuccessState (death)
 ///   ErrorConstructTag, ctor    — every error() factory call
 ///   VoidResult()               — DefaultConstructorIsSuccess
 ///   VoidResult::error()        — VoidResult::ErrorFactory, EmptyVoidErrorString
@@ -93,6 +94,28 @@ TEST(ResultTest, BoolOperatorFalseOnError) {
     EXPECT_FALSE(static_cast<bool>(r));
 }
 
+TEST(ResultTest, ValueIfReturnsPointerOnSuccess) {
+    Result<int> r(7);
+    ASSERT_NE(r.value_if(), nullptr);
+    EXPECT_EQ(*r.value_if(), 7);
+}
+
+TEST(ResultTest, ValueIfReturnsNullOnError) {
+    auto r = Result<int>::error("x");
+    EXPECT_EQ(r.value_if(), nullptr);
+}
+
+TEST(ResultTest, ErrorIfReturnsPointerOnError) {
+    auto r = Result<int>::error("x");
+    ASSERT_NE(r.error_if(), nullptr);
+    EXPECT_EQ(*r.error_if(), "x");
+}
+
+TEST(ResultTest, ErrorIfReturnsNullOnSuccess) {
+    Result<int> r(7);
+    EXPECT_EQ(r.error_if(), nullptr);
+}
+
 // value() & — lvalue reference; mutation propagates back
 TEST(ResultTest, ValueLvalueRefReturnsReference) {
     Result<int> r(55);
@@ -121,12 +144,6 @@ TEST(ResultTest, ErrorMessageAccessor) {
     auto r = Result<int>::error("specific error msg");
     const std::string& msg = r.error();
     EXPECT_EQ(msg, "specific error msg");
-}
-
-// error() on success state — throws std::bad_variant_access
-TEST(ResultTest, ErrorThrowsOnSuccessState) {
-    Result<int> r(42);
-    EXPECT_THROW([[maybe_unused]] const auto& e = r.error(), std::bad_variant_access);
 }
 
 // ===========================================================================
@@ -200,17 +217,13 @@ TEST(ResultTest, StringTypeValueRvalueMovesOut) {
 }
 
 // ===========================================================================
-// Death tests — assert fires when value() called on error state.
-// Compiled only in Debug builds: in Release (NDEBUG), assert is a no-op
-// and std::get throws std::bad_variant_access, which would crash the process
-// outside the death test sandbox — so the tests are gated on NDEBUG.
-// The assert paths are indirectly covered by success-path tests above.
+// Death tests — fail-fast contract for invalid accessors.
+// Result<T>::value() / error() and VoidResult::error() abort the process when
+// called on the wrong state.
 // ===========================================================================
 
-#ifndef NDEBUG
-
 TEST(ResultDeathTest, LvalueValueOnErrorState) {
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             auto r = Result<int>::error("bad");
             [[maybe_unused]] int& v = r.value();
@@ -219,7 +232,7 @@ TEST(ResultDeathTest, LvalueValueOnErrorState) {
 }
 
 TEST(ResultDeathTest, ConstLvalueValueOnErrorState) {
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             const auto r = Result<int>::error("bad");
             [[maybe_unused]] const int& v = r.value();
@@ -228,14 +241,21 @@ TEST(ResultDeathTest, ConstLvalueValueOnErrorState) {
 }
 
 TEST(ResultDeathTest, RvalueValueOnErrorState) {
-    EXPECT_DEBUG_DEATH(
+    EXPECT_DEATH(
         {
             [[maybe_unused]] auto v = Result<int>::error("bad").value();
         },
         ".*");
 }
 
-#endif  // NDEBUG
+TEST(ResultDeathTest, ErrorOnSuccessState) {
+    EXPECT_DEATH(
+        {
+            Result<int> r(42);
+            [[maybe_unused]] const auto& e = r.error();
+        },
+        ".*");
+}
 
 // ===========================================================================
 // VoidResult
@@ -295,6 +315,15 @@ TEST(VoidResultTest, BoolFalseOnError) {
 TEST(VoidResultTest, ErrorAccessorReturnsMessage) {
     auto r = VoidResult::error("specific error");
     EXPECT_EQ(r.error(), "specific error");
+}
+
+TEST(VoidResultDeathTest, ErrorOnSuccessState) {
+    EXPECT_DEATH(
+        {
+            VoidResult r;
+            [[maybe_unused]] const auto& e = r.error();
+        },
+        ".*");
 }
 
 // Copy semantics of VoidResult

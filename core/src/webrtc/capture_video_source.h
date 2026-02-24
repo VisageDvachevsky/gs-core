@@ -1,38 +1,24 @@
 #pragma once
 
-// Internal header — included only from webrtc_host.cpp and capture_video_source.cpp.
-// Requires libwebrtc headers; do NOT include from core/include/.
-
 #include "iframe_capture.h"
 
 #include <media/base/adapted_video_track_source.h>
+#include <api/video/color_space.h>
+#include <api/video/i420_buffer.h>
+#include <api/video/video_frame_buffer.h>
 
 #include <d3d11.h>
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
 namespace gamestream {
 
-/// Video track source that continuously polls IFrameCapture and pushes
-/// frames into the libwebrtc video pipeline.
-///
-/// Conversion path (Stage 3):
-///   DXGI BGRA texture
-///     → CopyResource to CPU-readable STAGING texture
-///     → Map / libyuv::ARGBToI420
-///     → webrtc::I420Buffer → webrtc::VideoFrame
-///     → AdaptedVideoTrackSource::OnFrame()
-///     → AMFVideoEncoder::Encode()
-///
-/// Stage 8+ optimisation: replace this with a direct GPU-path source that
-/// hands the D3D11 texture straight to AMF without any CPU round-trip.
-class CaptureVideoSource final : public webrtc::AdaptedVideoTrackSource {
+class CaptureVideoSource : public webrtc::AdaptedVideoTrackSource {
 public:
-    /// @param capture  Already-initialized capture backend.
-    ///                 Must outlive this object.
     explicit CaptureVideoSource(IFrameCapture* capture);
     ~CaptureVideoSource() override;
 
@@ -41,33 +27,47 @@ public:
     CaptureVideoSource(CaptureVideoSource&&)                 = delete;
     CaptureVideoSource& operator=(CaptureVideoSource&&)      = delete;
 
-    /// Start the internal capture thread. Called from add_video_track().
     void start();
-
-    /// Stop the internal capture thread. Blocks until the thread exits.
     void stop();
 
-    // webrtc::VideoTrackSourceInterface ----------------------------------------
     SourceState state() const override;
     bool remote()       const override { return false; }
-    bool is_screencast() const override { return true; }
+    // Treat as real-time video to minimize buffering on the receiver.
+    bool is_screencast() const override { return false; }
     std::optional<bool> needs_denoising() const override { return false; }
 
 private:
     void capture_loop();
-    void convert_and_push_frame(const CaptureFrame& frame);
+    void emit_frame(const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer,
+                    uint32_t rtp_timestamp,
+                    const webrtc::ColorSpace& color_space);
+    bool handle_acquire_failure(const Result<CaptureFrame>& frame_res,
+                                const webrtc::scoped_refptr<webrtc::I420Buffer>& last_i420,
+                                uint32_t rtp_timestamp,
+                                const webrtc::ColorSpace& color_space,
+                                bool& invalid_result_logged,
+                                bool& emitted_fallback);
+    void process_acquired_frame(const Result<CaptureFrame>& frame_res,
+                                webrtc::scoped_refptr<webrtc::I420Buffer>& last_i420,
+                                uint32_t& rtp_timestamp,
+                                std::chrono::steady_clock::time_point& next_emit_deadline,
+                                const webrtc::ColorSpace& color_space,
+                                bool& invalid_result_logged);
+    bool convert_frame_to_i420(const CaptureFrame& frame,
+                               webrtc::scoped_refptr<webrtc::I420Buffer>& i420_buffer);
     bool ensure_staging_texture(uint32_t width, uint32_t height);
 
     IFrameCapture* capture_;  // not owned
 
     Microsoft::WRL::ComPtr<ID3D11Device>        d3d_device_;
-    Microsoft::WRL::ComPtr<ID3D11DeviceContext>  d3d_context_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3d_context_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D>     staging_tex_;
     uint32_t staging_w_ = 0;
     uint32_t staging_h_ = 0;
 
     std::atomic<bool> running_{false};
-    std::jthread      thread_;
+    std::thread       thread_;
+    bool              timer_resolution_enabled_ = false;
 };
 
 } // namespace gamestream

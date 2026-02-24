@@ -4,6 +4,7 @@
 #include <variant>
 #include <optional>
 #include <cassert>
+#include <cstdlib>
 
 namespace gamestream {
 
@@ -45,22 +46,59 @@ public:
     bool has_value() const { return std::holds_alternative<detail::Ok<T>>(data_); }
     explicit operator bool() const { return has_value(); }
 
-    // Get value (assert fires on error state)
-    T& value() & {
-        assert(has_value() && "Result::value() called on error state");
-        return std::get<detail::Ok<T>>(data_).value;
+    // Non-throwing accessors for hot paths where exceptions are unacceptable.
+    T* value_if() noexcept {
+        auto* ok = std::get_if<detail::Ok<T>>(&data_);
+        return ok ? &ok->value : nullptr;
     }
-    const T& value() const & {
-        assert(has_value() && "Result::value() called on error state");
-        return std::get<detail::Ok<T>>(data_).value;
+    const T* value_if() const noexcept {
+        const auto* ok = std::get_if<detail::Ok<T>>(&data_);
+        return ok ? &ok->value : nullptr;
     }
-    T&& value() && {
-        assert(has_value() && "Result::value() called on error state");
-        return std::move(std::get<detail::Ok<T>>(data_).value);
+    std::string* error_if() noexcept {
+        auto* err = std::get_if<detail::Err>(&data_);
+        return err ? &err->message : nullptr;
+    }
+    const std::string* error_if() const noexcept {
+        const auto* err = std::get_if<detail::Err>(&data_);
+        return err ? &err->message : nullptr;
     }
 
-    // Get error message — throws std::bad_variant_access if called on success state
-    const std::string& error() const { return std::get<detail::Err>(data_).message; }
+    // Get value (assert fires on error state)
+    T& value() & {
+        auto* ok = std::get_if<detail::Ok<T>>(&data_);
+        if (!ok) {
+            assert(false && "Result::value() called on error state");
+            std::abort();
+        }
+        return ok->value;
+    }
+    const T& value() const & {
+        const auto* ok = std::get_if<detail::Ok<T>>(&data_);
+        if (!ok) {
+            assert(false && "Result::value() called on error state");
+            std::abort();
+        }
+        return ok->value;
+    }
+    T&& value() && {
+        auto* ok = std::get_if<detail::Ok<T>>(&data_);
+        if (!ok) {
+            assert(false && "Result::value() called on error state");
+            std::abort();
+        }
+        return std::move(ok->value);
+    }
+
+    // Get error message (fail-fast on success state)
+    const std::string& error() const {
+        const auto* err = std::get_if<detail::Err>(&data_);
+        if (!err) {
+            assert(false && "Result::error() called on success state");
+            std::abort();
+        }
+        return err->message;
+    }
 
 private:
     struct ErrorConstructTag {};
@@ -86,8 +124,14 @@ public:
     bool has_value() const { return !error_.has_value(); }
     explicit operator bool() const { return has_value(); }
 
-    // Get error message — undefined behaviour on success state; always check first
-    const std::string& error() const { return *error_; }
+    // Get error message (fail-fast on success state)
+    const std::string& error() const {
+        if (!error_) {
+            assert(false && "VoidResult::error() called on success state");
+            std::abort();
+        }
+        return *error_;
+    }
 
 private:
     std::optional<std::string> error_;

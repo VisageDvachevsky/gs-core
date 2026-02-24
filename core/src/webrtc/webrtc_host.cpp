@@ -1,196 +1,208 @@
 // Must be first: winsock2.h must precede windows.h (WebRTC rtc_base requirement)
 #include <winsock2.h>
+#include <windows.h>
 
 #include "webrtc_host.h"
 #include "iwebrtc_observer.h"
 #include "webrtc_types.h"
-
-// Internal pipeline
 #include "amf_webrtc_encoder.h"
 #include "capture_video_source.h"
 
-// libwebrtc: factory & threads
+// Suppress warnings produced by WebRTC headers under /W4 /WX.
+//   C4100 — unreferenced formal parameter (widespread in WebRTC observer callbacks)
+//   C4245 — signed/unsigned mismatch in WebRTC template internals
+//   C4267 — size_t narrowing inside WebRTC
+#pragma warning(push)
+#pragma warning(disable: 4100 4245 4267)
 #include <api/create_peerconnection_factory.h>
 #include <api/peer_connection_interface.h>
 #include <api/audio_codecs/builtin_audio_encoder_factory.h>
 #include <api/audio_codecs/builtin_audio_decoder_factory.h>
-#include <api/video_codecs/builtin_video_decoder_factory.h>
 #include <api/data_channel_interface.h>
 #include <api/jsep.h>
 #include <api/rtc_error.h>
 #include <api/media_stream_interface.h>
 #include <api/rtp_receiver_interface.h>
 #include <api/rtp_transceiver_interface.h>
+#include <api/rtp_parameters.h>
 #include <api/scoped_refptr.h>
 #include <api/make_ref_counted.h>
+#include <api/candidate.h>
+#include <p2p/base/port.h>
 #include <rtc_base/thread.h>
 #include <rtc_base/ssl_adapter.h>
 #include <rtc_base/copy_on_write_buffer.h>
+#pragma warning(pop)
 
+#include <d3d11.h>
+#include <d3d11_4.h>  // ID3D11Multithread
+#include <wrl/client.h>
 #include <spdlog/spdlog.h>
 
-#include <atomic>
-#include <format>
 #include <memory>
 #include <string>
 
 namespace gamestream {
 
-// ===========================================================================
-// One-shot observers — defined BEFORE WebRTCHostImpl so their full types are
-// visible when webrtc::make_ref_counted<T> is instantiated inside methods.
-// ===========================================================================
+namespace {
 
 // ---------------------------------------------------------------------------
-// SetLocalDescObserver — logs SetLocalDescription errors
+// State mapping helpers
 // ---------------------------------------------------------------------------
-class SetLocalDescObserver final
-    : public webrtc::SetSessionDescriptionObserver
-{
-public:
-    void OnSuccess() override {
-        spdlog::debug("[WebRTCHost] SetLocalDescription OK");
+
+PeerConnectionState map_pc_state(webrtc::PeerConnectionInterface::PeerConnectionState s) {
+    switch (s) {
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kNew:
+            return PeerConnectionState::kNew;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kConnecting:
+            return PeerConnectionState::kConnecting;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kConnected:
+            return PeerConnectionState::kConnected;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kDisconnected:
+            return PeerConnectionState::kDisconnected;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kFailed:
+            return PeerConnectionState::kFailed;
+        case webrtc::PeerConnectionInterface::PeerConnectionState::kClosed:
+            return PeerConnectionState::kClosed;
     }
+    return PeerConnectionState::kConnecting;
+}
+
+PeerConnectionState map_pc_state(webrtc::PeerConnectionInterface::IceConnectionState s) {
+    switch (s) {
+        case webrtc::PeerConnectionInterface::kIceConnectionNew:
+            return PeerConnectionState::kNew;
+        case webrtc::PeerConnectionInterface::kIceConnectionChecking:
+            return PeerConnectionState::kConnecting;
+        case webrtc::PeerConnectionInterface::kIceConnectionConnected:
+        case webrtc::PeerConnectionInterface::kIceConnectionCompleted:
+            return PeerConnectionState::kConnected;
+        case webrtc::PeerConnectionInterface::kIceConnectionDisconnected:
+            return PeerConnectionState::kDisconnected;
+        case webrtc::PeerConnectionInterface::kIceConnectionFailed:
+            return PeerConnectionState::kFailed;
+        case webrtc::PeerConnectionInterface::kIceConnectionClosed:
+            return PeerConnectionState::kClosed;
+        case webrtc::PeerConnectionInterface::kIceConnectionMax:
+            break;
+    }
+    return PeerConnectionState::kConnecting;
+}
+
+IceConnectionState map_ice_state(webrtc::PeerConnectionInterface::IceConnectionState s) {
+    switch (s) {
+        case webrtc::PeerConnectionInterface::kIceConnectionNew:          return IceConnectionState::kNew;
+        case webrtc::PeerConnectionInterface::kIceConnectionChecking:     return IceConnectionState::kChecking;
+        case webrtc::PeerConnectionInterface::kIceConnectionConnected:    return IceConnectionState::kConnected;
+        case webrtc::PeerConnectionInterface::kIceConnectionCompleted:    return IceConnectionState::kCompleted;
+        case webrtc::PeerConnectionInterface::kIceConnectionFailed:       return IceConnectionState::kFailed;
+        case webrtc::PeerConnectionInterface::kIceConnectionDisconnected: return IceConnectionState::kDisconnected;
+        case webrtc::PeerConnectionInterface::kIceConnectionClosed:       return IceConnectionState::kClosed;
+        default:                                                           return IceConnectionState::kNew;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SetDescriptionObserver
+// ---------------------------------------------------------------------------
+
+class SetDescriptionObserver : public webrtc::SetSessionDescriptionObserver {
+public:
+    static webrtc::scoped_refptr<SetDescriptionObserver> Create() {
+        return webrtc::make_ref_counted<SetDescriptionObserver>();
+    }
+    void OnSuccess() override {}
     void OnFailure(webrtc::RTCError error) override {
-        spdlog::error("[WebRTCHost] SetLocalDescription failed: {}", error.message());
+        spdlog::error("[WebRTCHost] SetSessionDescription failed: {}", error.message());
     }
 };
 
 // ---------------------------------------------------------------------------
-// SetRemoteDescObserver — logs SetRemoteDescription errors
+// CreateOfferObserver
+// Sets local description and waits for ICE gathering to complete.
+// The app observer is notified in OnIceGatheringChange(kComplete).
 // ---------------------------------------------------------------------------
-class SetRemoteDescObserver final
-    : public webrtc::SetSessionDescriptionObserver
-{
-public:
-    void OnSuccess() override {
-        spdlog::debug("[WebRTCHost] SetRemoteDescription OK");
-    }
-    void OnFailure(webrtc::RTCError error) override {
-        spdlog::error("[WebRTCHost] SetRemoteDescription failed: {}", error.message());
-    }
-};
 
-// ---------------------------------------------------------------------------
-// CreateOfferObserver — on success: SetLocalDescription + fire app callback
-// (SetLocalDescObserver must be fully defined above)
-// ---------------------------------------------------------------------------
-class CreateOfferObserver final
-    : public webrtc::CreateSessionDescriptionObserver
-{
+class CreateOfferObserver : public webrtc::CreateSessionDescriptionObserver {
 public:
-    CreateOfferObserver(webrtc::PeerConnectionInterface* pc,
-                        IWebRTCObserver*                 observer)
-        : pc_(pc), observer_(observer) {}
+    static webrtc::scoped_refptr<CreateOfferObserver> Create(
+        webrtc::PeerConnectionInterface* pc) {
+        return webrtc::make_ref_counted<CreateOfferObserver>(pc);
+    }
+    explicit CreateOfferObserver(webrtc::PeerConnectionInterface* pc) : pc_(pc) {}
 
     void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
-        // Serialize before SetLocalDescription takes ownership
-        std::string sdp_str;
-        desc->ToString(&sdp_str);
-
-        const webrtc::SdpType wtype = desc->GetType();
-
-        auto set_obs = webrtc::make_ref_counted<SetLocalDescObserver>();
-        pc_->SetLocalDescription(set_obs.get(), desc);
-
-        SessionDescriptionType our_type;
-        switch (wtype) {
-            case webrtc::SdpType::kOffer:    our_type = SessionDescriptionType::kOffer;    break;
-            case webrtc::SdpType::kPrAnswer: our_type = SessionDescriptionType::kPrAnswer; break;
-            case webrtc::SdpType::kAnswer:   our_type = SessionDescriptionType::kAnswer;   break;
-            default:                         our_type = SessionDescriptionType::kOffer;    break;
-        }
-
-        spdlog::info("[WebRTCHost] Local SDP ({})", to_string(our_type));
-        observer_->on_local_sdp_created(SessionDescription{our_type, std::move(sdp_str)});
+        // SetLocalDescription transfers ownership of desc.
+        // on_local_sdp_created() fires later in OnIceGatheringChange(kComplete)
+        // with the fully-populated SDP (all ICE candidates embedded).
+        pc_->SetLocalDescription(SetDescriptionObserver::Create().get(), desc);
     }
-
     void OnFailure(webrtc::RTCError error) override {
         spdlog::error("[WebRTCHost] CreateOffer failed: {}", error.message());
     }
-
 private:
-    webrtc::PeerConnectionInterface* pc_;
-    IWebRTCObserver*                 observer_;
+    webrtc::PeerConnectionInterface* pc_;  // not owned
 };
 
-// ===========================================================================
+} // namespace
+
+// ---------------------------------------------------------------------------
 // WebRTCHostImpl
-// ===========================================================================
+// ---------------------------------------------------------------------------
 
-class WebRTCHostImpl final
-    : public webrtc::PeerConnectionObserver
-    , public webrtc::DataChannelObserver
-{
+class WebRTCHostImpl : public webrtc::PeerConnectionObserver,
+                       public webrtc::DataChannelObserver {
 public:
-    WebRTCHostImpl() = default;
-    ~WebRTCHostImpl() override { do_close(); }
+    WebRTCHostImpl();
+    ~WebRTCHostImpl() override;
 
-    WebRTCHostImpl(const WebRTCHostImpl&) = delete;
-    WebRTCHostImpl& operator=(const WebRTCHostImpl&) = delete;
+    [[nodiscard]] VoidResult initialize(const WebRTCConfig& config, IWebRTCObserver* observer);
+    [[nodiscard]] VoidResult create_offer();
+    [[nodiscard]] VoidResult set_remote_description(SessionDescription sdp);
+    [[nodiscard]] VoidResult add_ice_candidate(IceCandidateInfo candidate);
+    [[nodiscard]] VoidResult add_video_track(IFrameCapture* capture, IEncoder* encoder);
+    void send_data(const uint8_t* data, size_t size);
+    void request_keyframe();
+    void close();
 
-    // IWebRTCHost API -------------------------------------------------------
-    VoidResult initialize(const WebRTCConfig& config, IWebRTCObserver* observer);
-    VoidResult create_offer();
-    VoidResult set_remote_description(SessionDescription sdp);
-    VoidResult add_ice_candidate(IceCandidateInfo candidate);
-    VoidResult add_video_track(IFrameCapture* capture, IEncoder* encoder);
-    void       send_data(const uint8_t* data, size_t size);
-    void       request_keyframe();
-    void       close();
+    PeerConnectionState get_connection_state() const { return state_.load(); }
+    bool is_initialized() const { return initialized_.load(); }
 
-    PeerConnectionState get_connection_state() const noexcept {
-        return state_.load(std::memory_order_acquire);
-    }
-    bool is_initialized() const noexcept { return initialized_; }
-
-    // Raw pointer to encoder factory for deferred set_pipeline() injection
-    AMFVideoEncoderFactory* encoder_factory_ = nullptr;
-
-private:
-    // PeerConnectionObserver -----------------------------------------------
-    void OnSignalingChange(
-        webrtc::PeerConnectionInterface::SignalingState) override {}
-
-    void OnDataChannel(
-        webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) override;
-
-    void OnIceConnectionChange(
-        webrtc::PeerConnectionInterface::IceConnectionState s) override;
-
-    void OnConnectionChange(
-        webrtc::PeerConnectionInterface::PeerConnectionState s) override;
-
+    // webrtc::PeerConnectionObserver
+    void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState) override {}
+    void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) override;
+    void OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState s) override;
+    void OnConnectionChange(webrtc::PeerConnectionInterface::PeerConnectionState s) override;
     void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
-
-    void OnIceGatheringChange(
-        webrtc::PeerConnectionInterface::IceGatheringState) override {}
-    void OnAddTrack(
-        webrtc::scoped_refptr<webrtc::RtpReceiverInterface>,
-        const std::vector<webrtc::scoped_refptr<
-            webrtc::MediaStreamInterface>>&) override {}
-    void OnTrack(
-        webrtc::scoped_refptr<webrtc::RtpTransceiverInterface>) override {}
-    void OnRemoveTrack(
-        webrtc::scoped_refptr<webrtc::RtpReceiverInterface>) override {}
+    void OnIceSelectedCandidatePairChanged(
+        const webrtc::CandidatePairChangeEvent& event) override;
+    void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState state) override;
+    void OnAddTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface>,
+                    const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&) override {}
+    void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface>) override {}
+    void OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface>) override {}
     void OnRenegotiationNeeded() override {}
 
-    // DataChannelObserver --------------------------------------------------
+    // webrtc::DataChannelObserver
     void OnStateChange() override;
     void OnMessage(const webrtc::DataBuffer& buffer) override;
-    void OnBufferedAmountChange(uint64_t) override {}
 
-    // Helpers --------------------------------------------------------------
-    void do_close();
-
-    static PeerConnectionState map_pc_state(
-        webrtc::PeerConnectionInterface::PeerConnectionState) noexcept;
-    static IceConnectionState map_ice_state(
-        webrtc::PeerConnectionInterface::IceConnectionState) noexcept;
-
-    // State ----------------------------------------------------------------
-    bool             initialized_ = false;
-    IWebRTCObserver* observer_    = nullptr;
+private:
+    [[nodiscard]] VoidResult fail_initialize(std::string msg);
+    [[nodiscard]] VoidResult initialize_network_stack();
+    [[nodiscard]] VoidResult create_worker_threads();
+    [[nodiscard]] VoidResult create_factory();
+    [[nodiscard]] VoidResult build_rtc_config(
+        const WebRTCConfig& config,
+        webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config);
+    [[nodiscard]] VoidResult create_peer_connection(
+        const webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config);
+    void create_input_data_channel();
+    void enable_d3d11_multithread(ID3D11Device* device) const;
+    void inject_encoder_factory(IEncoder* encoder, ID3D11Device* device);
+    [[nodiscard]] VoidResult add_video_transceiver(
+        const webrtc::scoped_refptr<webrtc::VideoTrackInterface>& video_track);
+    void cap_sender_framerate(const webrtc::scoped_refptr<webrtc::RtpSenderInterface>& sender) const;
 
     std::unique_ptr<webrtc::Thread> network_thread_;
     std::unique_ptr<webrtc::Thread> worker_thread_;
@@ -201,220 +213,345 @@ private:
     webrtc::scoped_refptr<webrtc::DataChannelInterface>           data_channel_;
     webrtc::scoped_refptr<CaptureVideoSource>                     video_source_;
 
+    // Non-owning pointer to the factory (owned by factory_ via CreatePeerConnectionFactory).
+    // Retained so set_encoder() can be called in add_video_track() before WebRTC's
+    // first Create() during SDP negotiation.
+    AMFVideoEncoderFactory* amf_encoder_factory_ = nullptr;
+
+    WebRTCConfig                     config_;
+    IWebRTCObserver*                 observer_ = nullptr;
+    std::atomic<bool>                initialized_{false};
     std::atomic<PeerConnectionState> state_{PeerConnectionState::kNew};
+    std::mutex                       encoder_mutex_;
+    IEncoder*                        encoder_ = nullptr;
+    bool                             ssl_initialized_ = false;
+    bool                             winsock_initialized_ = false;
 };
 
-// ===========================================================================
+// ---------------------------------------------------------------------------
 // WebRTCHostImpl — implementations
-// ===========================================================================
+// ---------------------------------------------------------------------------
 
-VoidResult WebRTCHostImpl::initialize(const WebRTCConfig& config,
-                                       IWebRTCObserver*    observer)
-{
-    if (initialized_) {
-        return VoidResult::error("WebRTCHostImpl::initialize: already initialized");
+WebRTCHostImpl::WebRTCHostImpl()  = default;
+WebRTCHostImpl::~WebRTCHostImpl() { close(); }
+
+VoidResult WebRTCHostImpl::fail_initialize(std::string msg) {
+    spdlog::error("[WebRTCHost] initialize failed: {}", msg);
+    close();
+    return VoidResult::error(std::move(msg));
+}
+
+VoidResult WebRTCHostImpl::initialize_network_stack() {
+    WSADATA wsa_data{};
+    const int wsa_result = ::WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    if (wsa_result != 0) {
+        spdlog::error("[WebRTCHost] WSAStartup failed: {}", wsa_result);
+        return VoidResult::error("WSAStartup failed: " + std::to_string(wsa_result));
     }
-    if (!observer) {
-        return VoidResult::error("WebRTCHostImpl::initialize: observer is null");
+    winsock_initialized_ = true;
+
+    if (!webrtc::InitializeSSL()) {
+        return fail_initialize("InitializeSSL failed");
     }
+    ssl_initialized_ = true;
+    return VoidResult();
+}
 
-    observer_ = observer;
-    rtc::InitializeSSL();
+VoidResult WebRTCHostImpl::create_worker_threads() {
+    network_thread_ = webrtc::Thread::CreateWithSocketServer();
+    if (!network_thread_) return fail_initialize("Failed to create network_thread");
+    network_thread_->SetName("network_thread", nullptr);
+    if (!network_thread_->Start()) return fail_initialize("Failed to start network_thread");
 
-    // Create and start libwebrtc threads
-    network_thread_   = rtc::Thread::CreateWithSocketServer();
-    worker_thread_    = rtc::Thread::Create();
-    signaling_thread_ = rtc::Thread::Create();
+    worker_thread_ = webrtc::Thread::Create();
+    if (!worker_thread_) return fail_initialize("Failed to create worker_thread");
+    worker_thread_->SetName("worker_thread", nullptr);
+    if (!worker_thread_->Start()) return fail_initialize("Failed to start worker_thread");
 
-    network_thread_->SetName("gs_net",  nullptr);
-    worker_thread_->SetName("gs_work",  nullptr);
-    signaling_thread_->SetName("gs_sig", nullptr);
+    signaling_thread_ = webrtc::Thread::Create();
+    if (!signaling_thread_) return fail_initialize("Failed to create signaling_thread");
+    signaling_thread_->SetName("signaling_thread", nullptr);
+    if (!signaling_thread_->Start()) return fail_initialize("Failed to start signaling_thread");
+    return VoidResult();
+}
 
-    network_thread_->Start();
-    worker_thread_->Start();
-    signaling_thread_->Start();
-
-    // AMFVideoEncoderFactory — deferred: encoder/device injected later
-    auto enc_factory = std::make_unique<AMFVideoEncoderFactory>();
-    encoder_factory_ = enc_factory.get();
+VoidResult WebRTCHostImpl::create_factory() {
+    // Create encoder factory with deferred injection.
+    // Save raw pointer BEFORE std::move — factory_ takes ownership, but we
+    // keep amf_encoder_factory_ as a non-owning observation point.
+    auto factory_owned = std::make_unique<AMFVideoEncoderFactory>();
+    amf_encoder_factory_ = factory_owned.get();
 
     factory_ = webrtc::CreatePeerConnectionFactory(
         network_thread_.get(),
         worker_thread_.get(),
         signaling_thread_.get(),
-        /*adm*/              nullptr,
+        /*default_adm=*/nullptr,
         webrtc::CreateBuiltinAudioEncoderFactory(),
         webrtc::CreateBuiltinAudioDecoderFactory(),
-        std::move(enc_factory),
-        webrtc::CreateBuiltinVideoDecoderFactory(),
-        /*audio_mixer*/      nullptr,
-        /*audio_processing*/ nullptr);
+        std::move(factory_owned),
+        /*video_decoder_factory=*/nullptr,   // sender-only host; no inbound video to decode
+        /*audio_mixer=*/nullptr,
+        /*audio_processing=*/nullptr);
 
-    if (!factory_) {
-        return VoidResult::error("CreatePeerConnectionFactory returned null");
+    if (!factory_) return fail_initialize("Failed to create PeerConnectionFactory");
+    return VoidResult();
+}
+
+VoidResult WebRTCHostImpl::build_rtc_config(
+    const WebRTCConfig& config,
+    webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config) {
+    rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+    // Disable TCP (UDP-only) for lower latency.
+    // Do NOT disable adapter enumeration: on machines with virtual adapters
+    // (Hyper-V, VPN — 198.18.0.x) disabling enumeration causes WebRTC to pick
+    // a virtual interface as the sole host candidate, which is unreachable from
+    // the browser.  Full enumeration lets ICE prefer the real LAN IP.
+    rtc_config.set_port_allocator_flags(webrtc::PORTALLOCATOR_DISABLE_TCP);
+    if (config.ice_backup_candidate_pair_ping_interval_ms <= 0) {
+        return fail_initialize("ice_backup_candidate_pair_ping_interval_ms must be > 0");
     }
+    if (config.ice_connection_receiving_timeout_ms <= 0) {
+        return fail_initialize("ice_connection_receiving_timeout_ms must be > 0");
+    }
+    // Reduce chances of hard fail when the initially-selected pair is a
+    // virtual adapter path. Values are runtime-configurable in WebRTCConfig.
+    rtc_config.ice_backup_candidate_pair_ping_interval =
+        config.ice_backup_candidate_pair_ping_interval_ms;
+    rtc_config.ice_connection_receiving_timeout =
+        config.ice_connection_receiving_timeout_ms;
 
-    // ICE configuration
-    webrtc::PeerConnectionInterface::RTCConfiguration rtc_cfg;
-    rtc_cfg.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-
-    for (const IceServer& srv : config.ice_servers) {
+    // Populate ICE servers from config.  Empty list = host candidates only
+    // (LAN/localhost).  For internet streaming, callers must supply STUN/TURN.
+    for (const auto& s : config.ice_servers) {
         webrtc::PeerConnectionInterface::IceServer ice;
-        ice.uri      = srv.uri;
-        ice.username = srv.username;
-        ice.password = srv.password;
-        rtc_cfg.servers.push_back(std::move(ice));
+        ice.uri      = s.uri;
+        ice.username = s.username;
+        ice.password = s.password;
+        rtc_config.servers.push_back(ice);
     }
+    return VoidResult();
+}
 
+VoidResult WebRTCHostImpl::create_peer_connection(
+    const webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config) {
     webrtc::PeerConnectionDependencies deps(this);
-    auto pc_or_err = factory_->CreatePeerConnectionOrError(rtc_cfg, std::move(deps));
-    if (!pc_or_err.ok()) {
-        return VoidResult::error(std::format(
-            "CreatePeerConnection failed: {}", pc_or_err.error().message()));
+    auto pc_res = factory_->CreatePeerConnectionOrError(rtc_config, std::move(deps));
+    if (!pc_res.ok()) {
+        return fail_initialize("Failed to create PeerConnection");
     }
+    pc_ = pc_res.MoveValue();
+    return VoidResult();
+}
 
-    pc_ = std::move(pc_or_err.value());
+void WebRTCHostImpl::create_input_data_channel() {
+    // Create input DataChannel now (we are the offerer).
+    // Stage 4 will switch to ordered=false, maxRetransmits=0 for input events.
+    webrtc::DataChannelInit dc_init;
+    dc_init.ordered = true;
+
+    auto dc_res = pc_->CreateDataChannelOrError(config_.input_channel_label, &dc_init);
+    if (dc_res.ok()) {
+        data_channel_ = dc_res.MoveValue();
+        data_channel_->RegisterObserver(this);
+    } else {
+        spdlog::error("[WebRTCHost] CreateDataChannel failed");
+    }
+}
+
+void WebRTCHostImpl::enable_d3d11_multithread(ID3D11Device* device) const {
+    if (!device) {
+        return;
+    }
+    // Capture thread + encode thread share the immediate context: enable D3D11 MT protection.
+    Microsoft::WRL::ComPtr<ID3D11Multithread> mt;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Multithread),
+                                         reinterpret_cast<void**>(mt.GetAddressOf())))) {
+        mt->SetMultithreadProtected(TRUE);
+        spdlog::debug("[WebRTCHost] D3D11 multithread protection enabled");
+    }
+}
+
+void WebRTCHostImpl::inject_encoder_factory(IEncoder* encoder, ID3D11Device* device) {
+    if (amf_encoder_factory_) {
+        amf_encoder_factory_->set_encoder(encoder, device);
+        return;
+    }
+    spdlog::warn("[WebRTCHost] amf_encoder_factory_ is null — encoder not injected");
+}
+
+VoidResult WebRTCHostImpl::add_video_transceiver(
+    const webrtc::scoped_refptr<webrtc::VideoTrackInterface>& video_track) {
+    // Use AddTransceiver with kSendOnly to avoid kSendRecv intersection
+    // issues when no decoder factory is provided (sender-only host).
+    webrtc::RtpTransceiverInit trans_init;
+    trans_init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
+    trans_init.stream_ids = {"gamestream_stream"};
+    auto res = pc_->AddTransceiver(video_track, trans_init);
+    if (!res.ok()) {
+        return VoidResult::error("Failed to add video transceiver to PeerConnection");
+    }
+    cap_sender_framerate(res.value()->sender());
+    return VoidResult();
+}
+
+void WebRTCHostImpl::cap_sender_framerate(
+    const webrtc::scoped_refptr<webrtc::RtpSenderInterface>& sender) const {
+    webrtc::RtpParameters params = sender->GetParameters();
+    for (auto& enc : params.encodings) {
+        enc.max_framerate = config_.video_max_framerate;
+        enc.max_bitrate_bps = config_.video_max_bitrate_bps;
+        if (config_.video_min_bitrate_bps > 0) {
+            enc.min_bitrate_bps = config_.video_min_bitrate_bps;
+        }
+        if (config_.disable_video_adaptation) {
+            enc.scale_resolution_down_by = 1.0;
+        }
+    }
+    if (config_.disable_video_adaptation) {
+        params.degradation_preference = webrtc::DegradationPreference::DISABLED;
+    }
+    webrtc::RTCError set_err = sender->SetParameters(params);
+    if (!set_err.ok()) {
+        spdlog::warn("[WebRTCHost] SetParameters(video sender limits) failed: {}",
+                     set_err.message());
+        return;
+    }
+    spdlog::debug(
+        "[WebRTCHost] Sender params: max_fps={} max_bitrate={}bps min_bitrate={}bps adaptation={}",
+        config_.video_max_framerate,
+        config_.video_max_bitrate_bps,
+        config_.video_min_bitrate_bps,
+        config_.disable_video_adaptation ? "off" : "on");
+}
+
+VoidResult WebRTCHostImpl::initialize(const WebRTCConfig& config,
+                                      IWebRTCObserver*    observer) {
+    if (initialized_) return VoidResult::error("Already initialized");
+    if (!observer) return VoidResult::error("Observer must not be null");
+    if (config.video_max_framerate <= 0) {
+        return VoidResult::error("video_max_framerate must be > 0");
+    }
+    if (config.video_max_bitrate_bps <= 0) {
+        return VoidResult::error("video_max_bitrate_bps must be > 0");
+    }
+    if (config.video_min_bitrate_bps < 0) {
+        return VoidResult::error("video_min_bitrate_bps must be >= 0");
+    }
+    if (config.video_min_bitrate_bps > config.video_max_bitrate_bps) {
+        return VoidResult::error("video_min_bitrate_bps must be <= video_max_bitrate_bps");
+    }
+    config_   = config;
+    observer_ = observer;
+
+    if (auto r = initialize_network_stack(); !r) return r;
+    if (auto r = create_worker_threads(); !r) return r;
+    if (auto r = create_factory(); !r) return r;
+
+    webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
+    if (auto r = build_rtc_config(config, rtc_config); !r) return r;
+    if (auto r = create_peer_connection(rtc_config); !r) return r;
+    create_input_data_channel();
+
     initialized_ = true;
-
-    spdlog::info("[WebRTCHost] Initialized. ICE servers: {}", config.ice_servers.size());
-    return {};
+    spdlog::info("[WebRTCHost] Initialized successfully");
+    return VoidResult();
 }
 
 VoidResult WebRTCHostImpl::create_offer() {
-    if (!initialized_ || !pc_) {
-        return VoidResult::error("create_offer: not initialized");
-    }
-
-    // Input DataChannel (unreliable, unordered — ideal for game input)
-    webrtc::DataChannelInit dc_init;
-    dc_init.ordered        = false;
-    dc_init.maxRetransmits = 0;
-
-    auto dc_or_err = pc_->CreateDataChannelOrError("input", &dc_init);
-    if (dc_or_err.ok()) {
-        data_channel_ = std::move(dc_or_err.value());
-        data_channel_->RegisterObserver(this);
-        spdlog::info("[WebRTCHost] DataChannel 'input' created (unreliable, unordered)");
-    } else {
-        spdlog::warn("[WebRTCHost] CreateDataChannel failed: {}",
-                     dc_or_err.error().message());
-    }
-
-    auto offer_obs = webrtc::make_ref_counted<CreateOfferObserver>(
-        pc_.get(), observer_);
-
-    webrtc::PeerConnectionInterface::RTCOfferAnswerOptions opts;
-    opts.offer_to_receive_audio = 0;
-    opts.offer_to_receive_video = 0;
-
-    pc_->CreateOffer(offer_obs.get(), opts);
-    spdlog::debug("[WebRTCHost] CreateOffer enqueued");
-    return {};
+    if (!pc_) return VoidResult::error("Not initialized");
+    // Use default options (offer_to_receive_video = kUndefined = -1).
+    // Setting offer_to_receive_video = 1 in Unified Plan changes the
+    // transceiver direction from kSendOnly to kSendRecv, which causes
+    // GetVideoCodecsForOffer() to return the intersection of send+recv codecs.
+    // Since video_decoder_factory=nullptr, recv codecs are empty → intersection
+    // is empty → video m-section gets rejected (port 0) in the SDP.
+    // With kUndefined the existing kSendOnly transceiver is used as-is, and
+    // GetVideoCodecsForOffer(kSendOnly) returns video_send_codecs (H264).
+    webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
+    pc_->CreateOffer(CreateOfferObserver::Create(pc_.get()).get(), options);
+    return VoidResult();
 }
 
 VoidResult WebRTCHostImpl::set_remote_description(SessionDescription sdp) {
-    if (!initialized_ || !pc_) {
-        return VoidResult::error("set_remote_description: not initialized");
-    }
+    if (!pc_) return VoidResult::error("Not initialized");
 
-    webrtc::SdpType wtype;
+    webrtc::SdpType type;
     switch (sdp.type) {
-        case SessionDescriptionType::kOffer:    wtype = webrtc::SdpType::kOffer;    break;
-        case SessionDescriptionType::kPrAnswer: wtype = webrtc::SdpType::kPrAnswer; break;
-        case SessionDescriptionType::kAnswer:   wtype = webrtc::SdpType::kAnswer;   break;
-        case SessionDescriptionType::kRollback: wtype = webrtc::SdpType::kRollback; break;
-        default:                                wtype = webrtc::SdpType::kAnswer;   break;
+        case SessionDescriptionType::kOffer:    type = webrtc::SdpType::kOffer;    break;
+        case SessionDescriptionType::kPrAnswer: type = webrtc::SdpType::kPrAnswer; break;
+        case SessionDescriptionType::kAnswer:   type = webrtc::SdpType::kAnswer;   break;
+        case SessionDescriptionType::kRollback: type = webrtc::SdpType::kRollback; break;
+        default:
+            return VoidResult::error(
+                std::string("Unknown SessionDescriptionType: ") +
+                std::to_string(static_cast<int>(sdp.type)));
     }
+    webrtc::SdpParseError parse_error;
+    std::unique_ptr<webrtc::SessionDescriptionInterface> desc =
+        webrtc::CreateSessionDescription(type, sdp.sdp, &parse_error);
 
-    webrtc::SdpParseError parse_err;
-    auto desc = webrtc::CreateSessionDescription(wtype, sdp.sdp, &parse_err);
     if (!desc) {
-        return VoidResult::error(std::format(
-            "SDP parse error at '{}': {}", parse_err.line, parse_err.description));
+        return VoidResult::error(
+            std::string("Failed to parse SDP: ") + parse_error.description);
     }
 
-    auto set_obs = webrtc::make_ref_counted<SetRemoteDescObserver>();
-    pc_->SetRemoteDescription(set_obs.get(), desc.release());
-
-    spdlog::info("[WebRTCHost] SetRemoteDescription({})", to_string(sdp.type));
-    return {};
+    pc_->SetRemoteDescription(SetDescriptionObserver::Create().get(), desc.release());
+    return VoidResult();
 }
 
 VoidResult WebRTCHostImpl::add_ice_candidate(IceCandidateInfo candidate) {
-    if (!initialized_ || !pc_) {
-        return VoidResult::error("add_ice_candidate: not initialized");
+    if (!pc_) return VoidResult::error("Not initialized");
+
+    webrtc::SdpParseError parse_error;
+    std::unique_ptr<webrtc::IceCandidateInterface> ice_candidate(
+        webrtc::CreateIceCandidate(
+            candidate.sdp_mid,
+            candidate.sdp_mline_index,
+            candidate.sdp,
+            &parse_error));
+
+    if (!ice_candidate) {
+        return VoidResult::error(
+            std::string("Failed to parse ICE candidate: ") + parse_error.description);
     }
 
-    webrtc::SdpParseError parse_err;
-    webrtc::IceCandidate* raw = webrtc::CreateIceCandidate(
-        candidate.sdp_mid,
-        candidate.sdp_mline_index,
-        candidate.sdp,
-        &parse_err);
-
-    if (!raw) {
-        return VoidResult::error(std::format(
-            "ICE candidate parse error: {}", parse_err.description));
+    if (!pc_->AddIceCandidate(ice_candidate.get())) {
+        spdlog::error("[WebRTCHost] AddIceCandidate rejected — candidate may be invalid or ICE agent not ready");
+        return VoidResult::error("AddIceCandidate failed");
     }
-
-    pc_->AddIceCandidate(
-        std::unique_ptr<webrtc::IceCandidate>(raw),
-        [](webrtc::RTCError err) {
-            if (!err.ok()) {
-                spdlog::warn("[WebRTCHost] AddIceCandidate error: {}", err.message());
-            }
-        });
-
-    spdlog::debug("[WebRTCHost] AddIceCandidate mid={} idx={}",
-                  candidate.sdp_mid, candidate.sdp_mline_index);
-    return {};
+    return VoidResult();
 }
 
-VoidResult WebRTCHostImpl::add_video_track(IFrameCapture* capture,
-                                            IEncoder*      encoder)
-{
-    if (!initialized_ || !pc_ || !factory_) {
-        return VoidResult::error("add_video_track: not initialized");
-    }
-    if (!capture || !encoder) {
-        return VoidResult::error("add_video_track: null capture or encoder");
-    }
+VoidResult WebRTCHostImpl::add_video_track(IFrameCapture* capture, IEncoder* encoder) {
+    if (!pc_ || !factory_) return VoidResult::error("Not initialized");
+    if (!capture) return VoidResult::error("capture must not be null");
+    if (!encoder) return VoidResult::error("encoder must not be null");
 
     ID3D11Device* device = capture->get_device();
-    if (!device) {
-        return VoidResult::error("add_video_track: capture device is null");
+    enable_d3d11_multithread(device);
+    inject_encoder_factory(encoder, device);
+
+    {
+        std::lock_guard<std::mutex> lock(encoder_mutex_);
+        encoder_ = encoder;
     }
 
-    // Inject pipeline into factory BEFORE any encoder is created
-    encoder_factory_->set_pipeline(encoder, device);
-
-    // Create and start the capture → I420 → WebRTC source
     video_source_ = webrtc::make_ref_counted<CaptureVideoSource>(capture);
+
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track(
+        factory_->CreateVideoTrack(video_source_, "gamestream_video"));
+
+    if (auto r = add_video_transceiver(video_track); !r) return r;
+
     video_source_->start();
-
-    auto video_track = factory_->CreateVideoTrack(video_source_, "video");
-    if (!video_track) {
-        video_source_->stop();
-        video_source_ = nullptr;
-        return VoidResult::error("add_video_track: CreateVideoTrack returned null");
-    }
-
-    auto result = pc_->AddTrack(video_track, {"stream"});
-    if (!result.ok()) {
-        video_source_->stop();
-        video_source_ = nullptr;
-        return VoidResult::error(std::format(
-            "add_video_track: AddTrack failed: {}", result.error().message()));
-    }
-
-    spdlog::info("[WebRTCHost] Video track added");
-    return {};
+    spdlog::info("[WebRTCHost] Video track added, capture started");
+    return VoidResult();
 }
 
 void WebRTCHostImpl::send_data(const uint8_t* data, size_t size) {
     if (!data_channel_ ||
-        data_channel_->state() != webrtc::DataChannelInterface::kOpen)
-    {
+        data_channel_->state() != webrtc::DataChannelInterface::kOpen) {
         return;
     }
     webrtc::CopyOnWriteBuffer buf(data, size);
@@ -422,12 +559,15 @@ void WebRTCHostImpl::send_data(const uint8_t* data, size_t size) {
 }
 
 void WebRTCHostImpl::request_keyframe() {
-    spdlog::debug("[WebRTCHost] request_keyframe — caller should invoke IEncoder::request_keyframe()");
+    std::lock_guard<std::mutex> lock(encoder_mutex_);
+    if (encoder_) {
+        encoder_->request_keyframe();
+    }
 }
 
-void WebRTCHostImpl::close() { do_close(); }
+void WebRTCHostImpl::close() {
+    initialized_ = false;
 
-void WebRTCHostImpl::do_close() {
     if (video_source_) {
         video_source_->stop();
         video_source_ = nullptr;
@@ -441,76 +581,121 @@ void WebRTCHostImpl::do_close() {
         pc_->Close();
         pc_ = nullptr;
     }
+    amf_encoder_factory_ = nullptr;
+    factory_              = nullptr;
 
-    factory_         = nullptr;
-    encoder_factory_ = nullptr;
+    if (network_thread_)   network_thread_->Stop();
+    if (worker_thread_)    worker_thread_->Stop();
+    if (signaling_thread_) signaling_thread_->Stop();
 
-    if (signaling_thread_) { signaling_thread_->Stop(); signaling_thread_.reset(); }
-    if (worker_thread_)    { worker_thread_->Stop();    worker_thread_.reset();    }
-    if (network_thread_)   { network_thread_->Stop();   network_thread_.reset();   }
+    network_thread_.reset();
+    worker_thread_.reset();
+    signaling_thread_.reset();
 
-    rtc::CleanupSSL();
+    if (ssl_initialized_) {
+        webrtc::CleanupSSL();
+        ssl_initialized_ = false;
+    }
+    if (winsock_initialized_) {
+        ::WSACleanup();
+        winsock_initialized_ = false;
+    }
 
-    state_.store(PeerConnectionState::kClosed, std::memory_order_release);
-    initialized_ = false;
-    spdlog::info("[WebRTCHost] Closed");
+    observer_ = nullptr;
+    state_ = PeerConnectionState::kClosed;
+    spdlog::debug("[WebRTCHost] Closed");
 }
 
 // ---------------------------------------------------------------------------
-// PeerConnectionObserver
+// PeerConnectionObserver callbacks
 // ---------------------------------------------------------------------------
 
 void WebRTCHostImpl::OnDataChannel(
-    webrtc::scoped_refptr<webrtc::DataChannelInterface> dc)
-{
-    spdlog::info("[WebRTCHost] OnDataChannel: label={}", dc->label());
+    webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) {
     if (!data_channel_) {
-        data_channel_ = std::move(dc);
+        data_channel_ = dc;
         data_channel_->RegisterObserver(this);
     }
 }
 
 void WebRTCHostImpl::OnIceConnectionChange(
-    webrtc::PeerConnectionInterface::IceConnectionState s)
-{
-    if (observer_) {
-        observer_->on_ice_connection_state_changed(map_ice_state(s));
-    }
+    webrtc::PeerConnectionInterface::IceConnectionState s) {
+    state_ = map_pc_state(s);
+    if (observer_) observer_->on_ice_connection_state_changed(map_ice_state(s));
 }
 
 void WebRTCHostImpl::OnConnectionChange(
-    webrtc::PeerConnectionInterface::PeerConnectionState s)
-{
-    const PeerConnectionState our = map_pc_state(s);
-    state_.store(our, std::memory_order_release);
-    spdlog::info("[WebRTCHost] ConnectionState → {}", to_string(our));
-    if (observer_) {
-        observer_->on_connection_state_changed(our);
-    }
+    webrtc::PeerConnectionInterface::PeerConnectionState s) {
+    state_ = map_pc_state(s);
+    if (observer_) observer_->on_connection_state_changed(state_.load());
 }
 
 void WebRTCHostImpl::OnIceCandidate(const webrtc::IceCandidate* candidate) {
-    if (!candidate || !observer_) return;
-    std::string sdp_str;
-    candidate->ToString(&sdp_str);
-    observer_->on_ice_candidate(IceCandidateInfo{
-        candidate->sdp_mid(),
-        candidate->sdp_mline_index(),
-        std::move(sdp_str)
-    });
+    if (!observer_) return;
+    std::string sdp;
+    candidate->ToString(&sdp);
+    IceCandidateInfo info;
+    info.sdp             = sdp;
+    info.sdp_mid         = candidate->sdp_mid();
+    info.sdp_mline_index = candidate->sdp_mline_index();
+    observer_->on_ice_candidate(info);
+}
+
+void WebRTCHostImpl::OnIceSelectedCandidatePairChanged(
+    const webrtc::CandidatePairChangeEvent& event) {
+    const auto& local = event.selected_candidate_pair.local_candidate();
+    const auto& remote = event.selected_candidate_pair.remote_candidate();
+    spdlog::debug("[WebRTCHost] Selected ICE pair: local={}({}/{})  remote={}({}/{})  reason={}",
+                  local.address().ToString(), local.type_name(), local.protocol(),
+                  remote.address().ToString(), remote.type_name(), remote.protocol(),
+                  event.reason);
+}
+
+void WebRTCHostImpl::OnIceGatheringChange(
+    webrtc::PeerConnectionInterface::IceGatheringState state) {
+    if (state != webrtc::PeerConnectionInterface::kIceGatheringComplete) return;
+    if (!observer_ || !pc_) return;
+
+    // All ICE candidates are now embedded in the local description SDP.
+    // Notify observer with the complete SDP — no ICE trickling needed for LAN/loopback.
+    // Trickle ICE is Stage 5.
+    const webrtc::SessionDescriptionInterface* local_desc = pc_->local_description();
+    if (!local_desc) {
+        spdlog::warn("[WebRTCHost] ICE gathering complete but local description is null");
+        return;
+    }
+
+    std::string sdp;
+    local_desc->ToString(&sdp);
+
+    const bool has_vbox = sdp.find("192.168.56.") != std::string::npos;
+    const bool has_meta = sdp.find("198.18.0.") != std::string::npos;
+    if (has_vbox || has_meta) {
+        spdlog::debug("[WebRTCHost] Local SDP contains virtual candidates (vbox={}, meta={})",
+                      has_vbox, has_meta);
+    }
+
+    SessionDescription s;
+    s.type = (local_desc->GetType() == webrtc::SdpType::kOffer)
+             ? SessionDescriptionType::kOffer
+             : SessionDescriptionType::kAnswer;
+    s.sdp = sdp;
+
+    spdlog::info("[WebRTCHost] ICE gathering complete — SDP ready ({} bytes)", sdp.size());
+    observer_->on_local_sdp_created(s);
+    observer_->on_ice_gathering_complete();
 }
 
 // ---------------------------------------------------------------------------
-// DataChannelObserver
+// DataChannelObserver callbacks
 // ---------------------------------------------------------------------------
 
 void WebRTCHostImpl::OnStateChange() {
-    if (!data_channel_ || !observer_) return;
-    const auto s = data_channel_->state();
-    if (s == webrtc::DataChannelInterface::kOpen) {
-        observer_->on_data_channel_open();
-    } else if (s == webrtc::DataChannelInterface::kClosed) {
-        observer_->on_data_channel_closed();
+    if (!data_channel_) return;
+    if (data_channel_->state() == webrtc::DataChannelInterface::kOpen) {
+        if (observer_) observer_->on_data_channel_open();
+    } else if (data_channel_->state() == webrtc::DataChannelInterface::kClosed) {
+        if (observer_) observer_->on_data_channel_closed();
     }
 }
 
@@ -521,78 +706,33 @@ void WebRTCHostImpl::OnMessage(const webrtc::DataBuffer& buffer) {
 }
 
 // ---------------------------------------------------------------------------
-// State mappers
+// WebRTCHost — PIMPL forwarding
 // ---------------------------------------------------------------------------
 
-PeerConnectionState WebRTCHostImpl::map_pc_state(
-    webrtc::PeerConnectionInterface::PeerConnectionState s) noexcept
-{
-    using W = webrtc::PeerConnectionInterface::PeerConnectionState;
-    switch (s) {
-        case W::kNew:          return PeerConnectionState::kNew;
-        case W::kConnecting:   return PeerConnectionState::kConnecting;
-        case W::kConnected:    return PeerConnectionState::kConnected;
-        case W::kDisconnected: return PeerConnectionState::kDisconnected;
-        case W::kFailed:       return PeerConnectionState::kFailed;
-        case W::kClosed:       return PeerConnectionState::kClosed;
-    }
-    return PeerConnectionState::kFailed;
-}
-
-IceConnectionState WebRTCHostImpl::map_ice_state(
-    webrtc::PeerConnectionInterface::IceConnectionState s) noexcept
-{
-    using W = webrtc::PeerConnectionInterface::IceConnectionState;
-    switch (s) {
-        case W::kIceConnectionNew:          return IceConnectionState::kNew;
-        case W::kIceConnectionChecking:     return IceConnectionState::kChecking;
-        case W::kIceConnectionConnected:    return IceConnectionState::kConnected;
-        case W::kIceConnectionCompleted:    return IceConnectionState::kCompleted;
-        case W::kIceConnectionFailed:       return IceConnectionState::kFailed;
-        case W::kIceConnectionDisconnected: return IceConnectionState::kDisconnected;
-        case W::kIceConnectionClosed:       return IceConnectionState::kClosed;
-        default:                            return IceConnectionState::kFailed;
-    }
-}
-
-// ===========================================================================
-// WebRTCHost — PIMPL facade
-// ===========================================================================
-
-WebRTCHost::WebRTCHost()
-    : impl_(std::make_unique<WebRTCHostImpl>()) {}
-
+WebRTCHost::WebRTCHost()  : impl_(std::make_unique<WebRTCHostImpl>()) {}
 WebRTCHost::~WebRTCHost() = default;
 
-VoidResult WebRTCHost::initialize(const WebRTCConfig& cfg, IWebRTCObserver* obs) {
-    return impl_->initialize(cfg, obs);
+VoidResult WebRTCHost::initialize(const WebRTCConfig& config, IWebRTCObserver* observer) {
+    return impl_->initialize(config, observer);
 }
-VoidResult WebRTCHost::create_offer() {
-    return impl_->create_offer();
-}
+VoidResult WebRTCHost::create_offer() { return impl_->create_offer(); }
 VoidResult WebRTCHost::set_remote_description(SessionDescription sdp) {
-    return impl_->set_remote_description(std::move(sdp));
+    return impl_->set_remote_description(sdp);
 }
-VoidResult WebRTCHost::add_ice_candidate(IceCandidateInfo c) {
-    return impl_->add_ice_candidate(std::move(c));
+VoidResult WebRTCHost::add_ice_candidate(IceCandidateInfo candidate) {
+    return impl_->add_ice_candidate(candidate);
 }
-VoidResult WebRTCHost::add_video_track(IFrameCapture* cap, IEncoder* enc) {
-    return impl_->add_video_track(cap, enc);
+VoidResult WebRTCHost::add_video_track(IFrameCapture* capture, IEncoder* encoder) {
+    return impl_->add_video_track(capture, encoder);
 }
 void WebRTCHost::send_data(const uint8_t* data, size_t size) {
     impl_->send_data(data, size);
 }
-void WebRTCHost::request_keyframe() {
-    impl_->request_keyframe();
-}
-void WebRTCHost::close() {
-    impl_->close();
-}
+void WebRTCHost::request_keyframe() { impl_->request_keyframe(); }
+void WebRTCHost::close()            { impl_->close(); }
 PeerConnectionState WebRTCHost::get_connection_state() const {
     return impl_->get_connection_state();
 }
-bool WebRTCHost::is_initialized() const {
-    return impl_->is_initialized();
-}
+bool WebRTCHost::is_initialized() const { return impl_->is_initialized(); }
 
 } // namespace gamestream

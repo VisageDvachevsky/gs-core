@@ -55,6 +55,21 @@ public:
 
     /// Called when the DataChannel is closed.
     virtual void on_data_channel_closed() = 0;
+
+    // -----------------------------------------------------------------------
+    // ICE gathering
+    // -----------------------------------------------------------------------
+
+    /// Called when local ICE gathering is complete.
+    ///
+    /// After this callback, on_local_sdp_created() fires with a SDP that has
+    /// all host/srflx candidates embedded — no trickle ICE needed for LAN
+    /// testing.  For internet sessions the signaling relay should already
+    /// have forwarded individual candidates via on_ice_candidate().
+    ///
+    /// Default implementation is intentionally empty: callers that do not
+    /// need gathering-complete notification simply skip overriding this.
+    virtual void on_ice_gathering_complete() {}
 };
 
 } // namespace gamestream

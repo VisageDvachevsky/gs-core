@@ -1,8 +1,8 @@
 # ✅ Project Checklist — Architecture Approval
 
 **Purpose**: Confirm all architectural decisions before development starts
-**Date**: 2026-02-15
-**Status**: Ready for approval
+**Date**: 2026-02-22
+**Status**: In Development
 
 ---
 
@@ -41,6 +41,9 @@
 - [x] **DXGI Output Duplication** for screen capture
   - <2 ms latency
   - Limitation: Only works in Borderless Windowed (Windows API limitation)
+
+- [x] **WGC (Windows Graphics Capture)** for per-window capture
+  - Modern API, supports independent window capture
 
 - [x] **Borderless Windowed Mode** (NOT Fullscreen Exclusive)
   - Enables DXGI capture
@@ -98,7 +101,7 @@
 | libwebrtc large build | [x] Cache artifacts, accept build time |
 | AMF only on AMD | [x] Add other GPUs on PHASE 6 |
 | SendInput() may be blocked by AC | [x] OK (Death Stranding no AC) |
-| Internet latency 25–45 ms baseline | [x] Accept as physical limit |
+| Internet latency 25–45 ms baseline | [x] Accept as limit |
 | No scaling >100 concurrent users | [x] OK for MVP (1 friend) |
 
 ---
@@ -107,15 +110,15 @@
 
 **PHASE 1 can START if ALL are true:**
 
-- [ ] AMD Radeon Driver 23.12+ installed
-- [ ] Windows SDK 22621 installed
-- [ ] Visual Studio 2022 C++ tools installed
-- [ ] CMake 3.20+ installed
-- [ ] libwebrtc M125+ sources/prebuilt obtained
-- [ ] AMF SDK 1.4.29+ downloaded
-- [ ] You understand ARCHITECTURE.md
-- [ ] You understand DESIGN_DECISIONS.md
-- [ ] You understand REQUIREMENTS.md
+- [x] AMD Radeon Driver 23.12+ installed
+- [x] Windows SDK 22621 installed
+- [x] Visual Studio 2022 C++ tools installed
+- [x] CMake 3.20+ installed
+- [x] libwebrtc M125+ sources/prebuilt obtained
+- [x] AMF SDK 1.4.29+ downloaded
+- [x] You understand ARCHITECTURE.md
+- [x] You understand DESIGN_DECISIONS.md
+- [x] You understand REQUIREMENTS.md
 
 **If ANY condition is false**: Go back to REQUIREMENTS.md and install/download.
 
@@ -137,9 +140,9 @@
 
 **PHASE 1**: DXGI captures @ 60 FPS, H.264 file output, <5ms latency ✅
 **PHASE 2**: WebRTC P2P works locally, <10ms e2e latency ✅
-**PHASE 3**: Signal server handles multiple clients, internet-ready ✅
-**PHASE 4**: Friend can play via browser, input responds ✅
-**PHASE 5**: Consistent <80ms echo latency over real internet ✅
+**PHASE 3**: Signal server handles multiple clients, internet-ready 🟡 (In progress)
+**PHASE 4**: Friend can play via browser, input responds 📋
+**PHASE 5**: Consistent <80ms echo latency over real internet 📋
 
 ---
 
@@ -152,7 +155,7 @@ Risk Assessment:        ✅ COMPLETE
 Dependencies Listed:    ✅ COMPLETE
 Pre-conditions Set:     ✅ COMPLETE
 
-Ready for PHASE 1?      → Check all boxes above, then YES
+Ready for PHASE 1?      → ✅ STARTED
 ```
 
 ---
@@ -160,11 +163,8 @@ Ready for PHASE 1?      → Check all boxes above, then YES
 ## 📝 Sign-Off
 
 Developer: (You)
-Date: 2026-02-15
-Approval: Pending your confirmation of all checkboxes above
-
-**Once all conditions met and questions answered:**
-→ Proceed to PHASE 1: `git checkout -b feature/phase-1-dxgi-poc`
+Date: 2026-02-22
+Approval: Architecture approved and implemented up to Phase 3
 
 ---
 

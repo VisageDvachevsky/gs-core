@@ -13,6 +13,7 @@
 // WinRT base
 #include <unknwn.h>
 #include <winrt/base.h>
+#include <roapi.h>
 
 // WinRT projections
 #include <winrt/Windows.Foundation.h>
@@ -72,18 +73,36 @@ public:
     winrt::Windows::Graphics::SizeInt32 pending_size_{};
 
     // Initialization helpers
+    bool init_apartment();
     bool init_d3d11_device();
     bool init_direct3d_device();
     bool init_capture_item(uintptr_t window_handle);
     bool init_frame_pool();
     bool start_capture_session();
+    bool close_capture_session();
+    bool close_frame_pool();
+    bool create_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size);
+    bool subscribe_frame_arrived();
+    bool create_capture_session();
 
-    // Resize — called from acquire_frame(), never from the callback
-    void recreate_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size);
+    winrt::Windows::Foundation::TypedEventHandler<wgc::Direct3D11CaptureFramePool,
+                                                  winrt::Windows::Foundation::IInspectable>
+        frame_arrived_handler_{};
+    winrt::event_token frame_arrived_token_{};
+    bool frame_arrived_registered_ = false;
+
+    // Resize — called from acquire_frame(), never from the callback.
+    // Returns VoidResult instead of throwing so callers can propagate via Result.
+    [[nodiscard]] VoidResult recreate_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size);
 
     // Single FrameArrived implementation shared by init_frame_pool and recreate_frame_pool.
     // Called from the WGC compositor thread.
     void on_frame_arrived(wgc::Direct3D11CaptureFramePool const& sender);
+
+    // Extract texture + build CaptureFrame from the currently-held WinRT frame.
+    // Called from acquire_frame() after held_frame_ has been populated.
+    [[nodiscard]] Result<CaptureFrame> extract_frame_data(
+        std::chrono::steady_clock::time_point acquire_start);
 };
 
 // ---------------------------------------------------------------------------
@@ -93,21 +112,15 @@ public:
 WGCCapture::WGCCapture() : impl_(std::make_unique<WGCCaptureImpl>()) {}
 
 WGCCapture::~WGCCapture() {
-    if (impl_->capture_session_) {
-        try { impl_->capture_session_.Close(); } catch (...) {}
-    }
-    if (impl_->frame_pool_) {
-        try { impl_->frame_pool_.Close(); } catch (...) {}
-    }
+    impl_->close_capture_session();
+    impl_->close_frame_pool();
 }
 
 VoidResult WGCCapture::initialize(uintptr_t window_handle) {
     spdlog::debug("[WGC] Initializing Windows.Graphics.Capture...");
 
-    try {
-        winrt::init_apartment();
-    } catch (...) {
-        // Already initialized — ignore
+    if (!impl_->init_apartment()) {
+        return VoidResult::error("Failed to initialize WinRT apartment");
     }
 
     if (!impl_->init_d3d11_device()) {
@@ -151,7 +164,9 @@ Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
         }
     }
     if (needs_resize) {
-        impl_->recreate_frame_pool(new_pool_size);
+        if (auto r = impl_->recreate_frame_pool(new_pool_size); !r) {
+            return Result<CaptureFrame>::error("resize failed: " + r.error());
+        }
     }
 
     auto start = std::chrono::steady_clock::now();
@@ -177,44 +192,8 @@ Result<CaptureFrame> WGCCapture::acquire_frame(uint64_t timeout_ms) {
         return Result<CaptureFrame>::error("no frame after signal");
     }
 
-    // Step 3: Extract ID3D11Texture2D from the WinRT frame.
-    // held_frame_ remains alive until release_frame() is called, keeping the texture valid.
-    auto surface = impl_->held_frame_.Surface();
-    auto access = surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
-
-    winrt::com_ptr<ID3D11Texture2D> winrt_texture;
-    HRESULT hr = access->GetInterface(winrt::guid_of<ID3D11Texture2D>(), winrt_texture.put_void());
-    if (FAILED(hr)) {
-        return Result<CaptureFrame>::error(
-            std::format("GetInterface(ID3D11Texture2D) failed: 0x{:08X}", static_cast<uint32_t>(hr)));
-    }
-
-    // Transfer ownership: winrt::com_ptr → Microsoft::WRL::ComPtr (both AddRef/Release compatible)
-    ComPtr<ID3D11Texture2D> wrl_texture;
-    wrl_texture.Attach(winrt_texture.detach());
-
-    D3D11_TEXTURE2D_DESC desc;
-    wrl_texture->GetDesc(&desc);
-
-    // SystemRelativeTime is synchronized with the DWM compositor (100-ns units → µs)
-    const uint64_t pts_us = static_cast<uint64_t>(impl_->held_frame_.SystemRelativeTime().count()) / 10;
-
-    // Update statistics
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    double capture_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-    impl_->stats_.frames_captured++;
-    impl_->stats_.avg_capture_ms =
-        (impl_->stats_.avg_capture_ms * (impl_->stats_.frames_captured - 1) + capture_ms)
-        / impl_->stats_.frames_captured;
-    if (capture_ms < impl_->stats_.min_capture_ms) impl_->stats_.min_capture_ms = capture_ms;
-    if (capture_ms > impl_->stats_.max_capture_ms) impl_->stats_.max_capture_ms = capture_ms;
-
-    impl_->current_capture_frame_.texture = wrl_texture;
-    impl_->current_capture_frame_.width = desc.Width;
-    impl_->current_capture_frame_.height = desc.Height;
-    impl_->current_capture_frame_.timestamp_us = pts_us;
-
-    return impl_->current_capture_frame_;
+    // Step 3: extract texture from the WinRT frame and fill CaptureFrame
+    return impl_->extract_frame_data(start);
 }
 
 void WGCCapture::release_frame() {
@@ -248,6 +227,19 @@ ID3D11Device* WGCCapture::get_device() const {
 // ---------------------------------------------------------------------------
 // WGCCaptureImpl — initialization helpers
 // ---------------------------------------------------------------------------
+
+bool WGCCaptureImpl::init_apartment() {
+    HRESULT hr = ::RoInitialize(RO_INIT_MULTITHREADED);
+    if (hr == S_OK || hr == S_FALSE) {
+        return true;
+    }
+    if (hr == RPC_E_CHANGED_MODE) {
+        spdlog::debug("[WGC] RoInitialize: already initialized in a different mode");
+        return true;
+    }
+    spdlog::error("[WGC] RoInitialize failed: 0x{:08X}", static_cast<uint32_t>(hr));
+    return false;
+}
 
 bool WGCCaptureImpl::init_d3d11_device() {
     D3D_FEATURE_LEVEL feature_levels[] = { D3D_FEATURE_LEVEL_11_0 };
@@ -317,16 +309,24 @@ bool WGCCaptureImpl::init_capture_item(uintptr_t window_handle) {
     GetWindowTextW(hwnd, window_title, static_cast<int>(std::size(window_title)));
     spdlog::debug("[WGC] Capturing window: {}", winrt::to_string(window_title));
 
-    auto interop = winrt::get_activation_factory<wgc::GraphicsCaptureItem,
-                                                  IGraphicsCaptureItemInterop>();
-    try {
-        winrt::check_hresult(interop->CreateForWindow(
-            hwnd,
-            winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
-            winrt::put_abi(capture_item_)
-        ));
-    } catch (const winrt::hresult_error& e) {
-        spdlog::error("[WGC] CreateForWindow failed: 0x{:08X}", static_cast<uint32_t>(e.code()));
+    winrt::com_ptr<IGraphicsCaptureItemInterop> interop;
+    const winrt::hstring class_id = L"Windows.Graphics.Capture.GraphicsCaptureItem";
+    HRESULT hr = ::RoGetActivationFactory(
+        reinterpret_cast<HSTRING>(winrt::get_abi(class_id)),
+        __uuidof(IGraphicsCaptureItemInterop),
+        interop.put_void());
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] RoGetActivationFactory(GraphicsCaptureItem) failed: 0x{:08X}",
+                      static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    hr = interop->CreateForWindow(
+        hwnd,
+        winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+        winrt::put_abi(capture_item_));
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] CreateForWindow failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
 
@@ -335,23 +335,152 @@ bool WGCCaptureImpl::init_capture_item(uintptr_t window_handle) {
     return true;
 }
 
+bool WGCCaptureImpl::close_capture_session() {
+    if (!capture_session_) {
+        return true;
+    }
+    auto closable = capture_session_.try_as<winrt::Windows::Foundation::IClosable>();
+    if (closable) {
+        auto* closable_abi =
+            reinterpret_cast<ABI::Windows::Foundation::IClosable*>(winrt::get_abi(closable));
+        HRESULT hr = closable_abi->Close();
+        if (FAILED(hr)) {
+            spdlog::warn("[WGC] CaptureSession::Close failed: 0x{:08X}", static_cast<uint32_t>(hr));
+            capture_session_ = nullptr;
+            return false;
+        }
+    }
+    capture_session_ = nullptr;
+    return true;
+}
+
+bool WGCCaptureImpl::close_frame_pool() {
+    if (!frame_pool_) {
+        return true;
+    }
+    if (frame_arrived_registered_) {
+        auto* pool_abi =
+            reinterpret_cast<ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool*>(
+                winrt::get_abi(frame_pool_));
+        EventRegistrationToken token{};
+        token.value = frame_arrived_token_.value;
+        HRESULT hr = pool_abi->remove_FrameArrived(token);
+        if (FAILED(hr)) {
+            spdlog::warn("[WGC] remove_FrameArrived failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        }
+        frame_arrived_registered_ = false;
+        frame_arrived_handler_ = {};
+        frame_arrived_token_ = {};
+    }
+    auto closable = frame_pool_.try_as<winrt::Windows::Foundation::IClosable>();
+    if (closable) {
+        auto* closable_abi =
+            reinterpret_cast<ABI::Windows::Foundation::IClosable*>(winrt::get_abi(closable));
+        HRESULT hr = closable_abi->Close();
+        if (FAILED(hr)) {
+            spdlog::warn("[WGC] FramePool::Close failed: 0x{:08X}", static_cast<uint32_t>(hr));
+            frame_pool_ = nullptr;
+            return false;
+        }
+    }
+    frame_pool_ = nullptr;
+    return true;
+}
+
+bool WGCCaptureImpl::subscribe_frame_arrived() {
+    if (!frame_pool_) {
+        spdlog::error("[WGC] subscribe_frame_arrived called with null frame pool");
+        return false;
+    }
+    frame_arrived_handler_ =
+        winrt::Windows::Foundation::TypedEventHandler<wgc::Direct3D11CaptureFramePool,
+                                                      winrt::Windows::Foundation::IInspectable>(
+            [this](auto&& sender, auto&&) { on_frame_arrived(sender); });
+
+    auto* pool_abi =
+        reinterpret_cast<ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool*>(
+            winrt::get_abi(frame_pool_));
+    using FrameArrivedHandlerAbi =
+        ABI::Windows::Foundation::__FITypedEventHandler_2_Windows__CGraphics__CCapture__CDirect3D11CaptureFramePool_IInspectable_t;
+    EventRegistrationToken token{};
+    HRESULT hr = pool_abi->add_FrameArrived(
+        reinterpret_cast<FrameArrivedHandlerAbi*>(winrt::get_abi(frame_arrived_handler_)),
+        &token);
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] add_FrameArrived failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        frame_arrived_handler_ = {};
+        frame_arrived_token_ = {};
+        return false;
+    }
+    frame_arrived_token_.value = token.value;
+    frame_arrived_registered_ = true;
+    return true;
+}
+
+bool WGCCaptureImpl::create_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size) {
+    if (!direct3d_device_) {
+        spdlog::error("[WGC] CreateFreeThreaded called without Direct3D device");
+        return false;
+    }
+    winrt::com_ptr<ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2> factory;
+    const winrt::hstring class_id = L"Windows.Graphics.Capture.Direct3D11CaptureFramePool";
+    HRESULT hr = ::RoGetActivationFactory(
+        reinterpret_cast<HSTRING>(winrt::get_abi(class_id)),
+        __uuidof(ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2),
+        factory.put_void());
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] RoGetActivationFactory(Direct3D11CaptureFramePool) failed: 0x{:08X}",
+                      static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    winrt::com_ptr<ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool> pool_abi;
+    const ABI::Windows::Graphics::SizeInt32 abi_size{
+        new_size.Width,
+        new_size.Height
+    };
+    hr = factory->CreateFreeThreaded(
+        reinterpret_cast<ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice*>(
+            winrt::get_abi(direct3d_device_)),
+        static_cast<ABI::Windows::Graphics::DirectX::DirectXPixelFormat>(
+            wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized),
+        2,
+        abi_size,
+        pool_abi.put());
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] CreateFreeThreaded failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    frame_pool_ = { pool_abi.detach(), winrt::take_ownership_from_abi };
+    return subscribe_frame_arrived();
+}
+
+bool WGCCaptureImpl::create_capture_session() {
+    if (!frame_pool_ || !capture_item_) {
+        spdlog::error("[WGC] CreateCaptureSession called without frame pool or capture item");
+        return false;
+    }
+    winrt::com_ptr<ABI::Windows::Graphics::Capture::IGraphicsCaptureSession> session_abi;
+    auto* pool_abi =
+        reinterpret_cast<ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool*>(
+            winrt::get_abi(frame_pool_));
+    HRESULT hr = pool_abi->CreateCaptureSession(
+        reinterpret_cast<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem*>(
+            winrt::get_abi(capture_item_)),
+        session_abi.put());
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] CreateCaptureSession failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    capture_session_ = { session_abi.detach(), winrt::take_ownership_from_abi };
+    return true;
+}
+
 bool WGCCaptureImpl::init_frame_pool() {
     current_size_ = capture_item_.Size();
 
-    try {
-        frame_pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-            direct3d_device_,
-            wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
-            current_size_
-        );
-
-        frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
-            on_frame_arrived(sender);
-        });
-    } catch (const winrt::hresult_error& e) {
-        spdlog::error("[WGC] Direct3D11CaptureFramePool::CreateFreeThreaded failed: 0x{:08X}",
-                      static_cast<uint32_t>(e.code()));
+    if (!create_frame_pool(current_size_)) {
         return false;
     }
 
@@ -360,16 +489,70 @@ bool WGCCaptureImpl::init_frame_pool() {
 }
 
 bool WGCCaptureImpl::start_capture_session() {
-    try {
-        capture_session_ = frame_pool_.CreateCaptureSession(capture_item_);
-        capture_session_.StartCapture();
-    } catch (const winrt::hresult_error& e) {
-        spdlog::error("[WGC] StartCapture failed: 0x{:08X}", static_cast<uint32_t>(e.code()));
+    if (!create_capture_session()) {
+        return false;
+    }
+
+    auto* session_abi =
+        reinterpret_cast<ABI::Windows::Graphics::Capture::IGraphicsCaptureSession*>(
+            winrt::get_abi(capture_session_));
+    HRESULT hr = session_abi->StartCapture();
+    if (FAILED(hr)) {
+        spdlog::error("[WGC] StartCapture failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        capture_session_ = nullptr;
         return false;
     }
 
     spdlog::debug("[WGC] Capture session started");
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// WGCCaptureImpl::extract_frame_data
+//
+// Called from acquire_frame() after held_frame_ has been populated under the mutex.
+// Extracts the ID3D11Texture2D, updates timing statistics, and returns CaptureFrame.
+// ---------------------------------------------------------------------------
+Result<CaptureFrame> WGCCaptureImpl::extract_frame_data(
+    std::chrono::steady_clock::time_point acquire_start) {
+    // held_frame_ remains alive until release_frame() is called, keeping the texture valid.
+    auto surface = held_frame_.Surface();
+    auto access = surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+
+    winrt::com_ptr<ID3D11Texture2D> winrt_texture;
+    HRESULT hr = access->GetInterface(winrt::guid_of<ID3D11Texture2D>(), winrt_texture.put_void());
+    if (FAILED(hr)) {
+        return Result<CaptureFrame>::error(
+            std::format("GetInterface(ID3D11Texture2D) failed: 0x{:08X}",
+                        static_cast<uint32_t>(hr)));
+    }
+
+    // Transfer ownership: winrt::com_ptr → Microsoft::WRL::ComPtr
+    ComPtr<ID3D11Texture2D> wrl_texture;
+    wrl_texture.Attach(winrt_texture.detach());
+
+    D3D11_TEXTURE2D_DESC desc;
+    wrl_texture->GetDesc(&desc);
+
+    // SystemRelativeTime is synchronized with the DWM compositor (100-ns units → µs)
+    const uint64_t pts_us =
+        static_cast<uint64_t>(held_frame_.SystemRelativeTime().count()) / 10;
+
+    // Update statistics
+    const double capture_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - acquire_start).count();
+    stats_.frames_captured++;
+    stats_.avg_capture_ms =
+        (stats_.avg_capture_ms * (stats_.frames_captured - 1) + capture_ms)
+        / stats_.frames_captured;
+    if (capture_ms < stats_.min_capture_ms) stats_.min_capture_ms = capture_ms;
+    if (capture_ms > stats_.max_capture_ms) stats_.max_capture_ms = capture_ms;
+
+    current_capture_frame_.texture      = wrl_texture;
+    current_capture_frame_.width        = desc.Width;
+    current_capture_frame_.height       = desc.Height;
+    current_capture_frame_.timestamp_us = pts_us;
+    return current_capture_frame_;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,35 +596,21 @@ void WGCCaptureImpl::on_frame_arrived(wgc::Direct3D11CaptureFramePool const& sen
 // a re-entrancy loop.  The resize flag and new size are read under frame_mutex_
 // by acquire_frame() before this call, so no further locking is needed here.
 // ---------------------------------------------------------------------------
-void WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size) {
+VoidResult WGCCaptureImpl::recreate_frame_pool(winrt::Windows::Graphics::SizeInt32 new_size) {
     // Close old session and pool (blocks until pending callbacks finish)
-    if (capture_session_) {
-        capture_session_.Close();
-        capture_session_ = nullptr;
+    close_capture_session();
+    close_frame_pool();
+
+    if (!create_frame_pool(new_size)) {
+        return VoidResult::error("recreate_frame_pool failed: CreateFreeThreaded");
     }
-    if (frame_pool_) {
-        frame_pool_.Close();
-        frame_pool_ = nullptr;
+    if (!start_capture_session()) {
+        return VoidResult::error("recreate_frame_pool failed: StartCapture");
     }
-
-    // Recreate with new dimensions
-    frame_pool_ = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
-        direct3d_device_,
-        wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
-        new_size
-    );
-
-    // Re-subscribe using the same handler as init_frame_pool
-    frame_pool_.FrameArrived([this](auto&& sender, auto&&) {
-        on_frame_arrived(sender);
-    });
-
-    capture_session_ = frame_pool_.CreateCaptureSession(capture_item_);
-    capture_session_.StartCapture();
 
     current_size_ = new_size;
     spdlog::info("[WGC] Frame pool recreated: {}x{}", new_size.Width, new_size.Height);
+    return VoidResult();
 }
 
 } // namespace gamestream

@@ -1,49 +1,61 @@
 #pragma once
 
 // Internal header — included ONLY from webrtc_host.cpp and amf_webrtc_encoder.cpp.
-// Requires libwebrtc headers; do NOT include from core/include/.
+// Requires libwebrtc and D3D11 headers; do NOT include from core/include/.
 
 #include "iencoder.h"
 #include "encoder_types.h"
 #include "capture_types.h"
 #include "result.h"
 
-// libwebrtc video encoder API
+// Suppress warnings produced by WebRTC headers under /W4 /WX.
+// These originate in third-party code that we cannot modify:
+//   C4100 — unreferenced formal parameter (common in WebRTC callbacks/overrides)
+//   C4245 — signed/unsigned mismatch in conversions inside WebRTC templates
+//   C4267 — size_t → smaller type conversion in WebRTC internals
+#pragma warning(push)
+#pragma warning(disable: 4100 4245 4267)
 #include <api/video_codecs/video_encoder.h>
 #include <api/video_codecs/video_encoder_factory.h>
 #include <api/video_codecs/sdp_video_format.h>
 #include <api/environment/environment.h>
-
-// libwebrtc video frame
 #include <api/video/video_frame.h>
 #include <api/video/i420_buffer.h>
+#include <modules/video_coding/include/video_codec_interface.h>
+#include <third_party/libyuv/include/libyuv.h>
+#pragma warning(pop)
 
-// D3D11 for staging texture (I420 → BGRA → GPU upload)
 #include <d3d11.h>
 #include <wrl/client.h>
 
 #include <atomic>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace gamestream {
 
 /// WebRTC VideoEncoder adapter wrapping our IEncoder (AMFEncoder).
 ///
-/// WebRTC delivers frames as I420 VideoFrame. Pipeline:
-///   1. I420 → BGRA via libyuv::I420ToARGB  (CPU; ~0.5 ms at 1080p)
-///   2. BGRA data → D3D11 DEFAULT texture via UpdateSubresource
-///   3. Texture → IEncoder::encode()  (zero-copy: AMF CreateSurfaceFromDX11Native)
-///   4. Encoded NALUs → callback_->OnEncodedImage()
+/// WebRTC delivers I420 VideoFrames. Pipeline (Stage 3):
+///   1. I420 → BGRA via libyuv::I420ToARGB (CPU step;
+///      BGRA = DXGI_FORMAT_B8G8R8A8_UNORM — matches AMF_SURFACE_BGRA).
+///   2. BGRA CPU buffer → D3D11 BGRA GPU texture via UpdateSubresource.
+///   3. GPU texture wrapped in CaptureFrame → IEncoder::encode() (AMF zero-copy
+///      via CreateSurfaceFromDX11Native).
+///   4. Encoded Annex-B NALUs → callback_->OnEncodedImage().
 ///
-/// Future optimisation (Stage 8+): bypass I420 entirely — feed the DXGI
-/// capture texture directly to AMF with zero CPU round-trip.
-class AMFVideoEncoder final : public webrtc::VideoEncoder {
+/// Stage 8 optimization: bypass I420/BGRA conversion entirely by feeding the
+/// DXGI capture texture directly to AMF (GPU-only pipeline).
+///
+/// Thread safety: Encode() is called from WebRTC's encode thread while
+/// CaptureVideoSource runs its own capture thread — both share the D3D11
+/// immediate context.  Caller MUST enable ID3D11Multithread protection on the
+/// device before calling Encode() (done in WebRTCHostImpl::add_video_track).
+class AMFVideoEncoder : public webrtc::VideoEncoder {
 public:
-    /// @param encoder  Shared AMFEncoder instance (already initialized).
-    ///                 Must outlive this object.
-    /// @param device   D3D11 device used by the AMFEncoder context.
-    ///                 Must outlive this object.
+    /// @param encoder  Initialized IEncoder (AMFEncoder). Not owned; must outlive this object.
+    /// @param device   D3D11 device shared with IEncoder. Not owned; must outlive this object.
     AMFVideoEncoder(IEncoder* encoder, ID3D11Device* device);
     ~AMFVideoEncoder() override;
 
@@ -52,19 +64,21 @@ public:
     AMFVideoEncoder(AMFVideoEncoder&&)                 = delete;
     AMFVideoEncoder& operator=(AMFVideoEncoder&&)      = delete;
 
-    // webrtc::VideoEncoder interface ------------------------------------------
+    // webrtc::VideoEncoder interface
 
-    int32_t InitEncode(const webrtc::VideoCodec*             codec_settings,
-                       const webrtc::VideoEncoder::Settings& settings) override;
+    /// Creates the D3D11 BGRA texture sized to codec_settings dimensions.
+    int32_t InitEncode(const webrtc::VideoCodec*                  codec_settings,
+                       const webrtc::VideoEncoder::Settings&       settings) override;
 
-    /// frame_types[0] == kVideoFrameKey → force IDR (PLI/FIR recovery).
+    /// Encodes one frame.  frame_types[0] == kVideoFrameKey → forces IDR.
     int32_t Encode(const webrtc::VideoFrame&                  frame,
                    const std::vector<webrtc::VideoFrameType>* frame_types) override;
 
     int32_t RegisterEncodeCompleteCallback(
         webrtc::EncodedImageCallback* callback) override;
 
-    /// Update bitrate/framerate on RTCP REMB / TWCC feedback.
+    /// Passes bitrate/framerate updates from RTCP feedback to the encoder.
+    /// Full adaptive bitrate is Stage 8; currently a no-op placeholder.
     void SetRates(const webrtc::VideoEncoder::RateControlParameters& parameters) override;
 
     int32_t Release() override;
@@ -72,40 +86,57 @@ public:
     webrtc::VideoEncoder::EncoderInfo GetEncoderInfo() const override;
 
 private:
-    void convert_and_upload(rtc::scoped_refptr<webrtc::I420BufferInterface> i420);
+    // Drop stale frames to keep end-to-end latency bounded.
+    static constexpr int64_t kMaxFrameAgeUs = 120'000;
+    static constexpr uint64_t kTransientWarnEveryN = 120;
 
-    IEncoder*     encoder_;     // not owned
-    ID3D11Device* d3d_device_;  // not owned
+    /// Convert I420 → BGRA, upload to GPU texture, call IEncoder::encode().
+    [[nodiscard]] Result<EncodedFrame> encode_frame(const webrtc::VideoFrame& frame,
+                                                    bool                      force_keyframe);
 
-    webrtc::EncodedImageCallback* callback_ = nullptr;
+    /// Create or resize the BGRA GPU texture.  Returns false and logs on failure.
+    bool ensure_gpu_texture(uint32_t width, uint32_t height);
+    bool should_drop_stale_frame(const webrtc::VideoFrame& frame);
+    bool should_force_keyframe(const std::vector<webrtc::VideoFrameType>* frame_types);
+    int32_t handle_encode_failure(const Result<EncodedFrame>& res);
+    static webrtc::CodecSpecificInfo make_h264_codec_specific_info(bool is_keyframe);
+    void log_transient_skip(std::string_view reason, uint64_t skip_count, int64_t frame_age_us);
 
+    IEncoder*                     encoder_;     // not owned
+    ID3D11Device*                 d3d_device_;  // not owned
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> d3d_context_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D>     staging_texture_;
-    uint32_t staging_w_ = 0;
-    uint32_t staging_h_ = 0;
-    std::vector<uint8_t> argb_buf_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>     gpu_tex_;
+    uint32_t                      tex_width_  = 0;
+    uint32_t                      tex_height_ = 0;
+    std::vector<uint8_t>          bgra_buf_;   // CPU scratch: I420 → BGRA
 
-    std::atomic<bool> force_keyframe_{false};
+    webrtc::EncodedImageCallback* callback_       = nullptr;
+    std::atomic<bool>             force_keyframe_{false};
+    bool                          waiting_for_first_keyframe_ = true;
+    uint64_t                      encoded_frames_ = 0;
+    uint64_t                      dropped_stale_frames_ = 0;
+    uint64_t                      transient_no_output_frames_ = 0;
+    uint64_t                      transient_input_full_frames_ = 0;
 };
 
 /// WebRTC VideoEncoderFactory that produces AMFVideoEncoder instances.
 ///
-/// Registered with PeerConnectionFactory.
-/// Advertises H.264 Baseline Profile Level 3.1 (profile-level-id=42e01f).
+/// Designed with deferred injection:
+///   1. Constructed in WebRTCHostImpl::initialize() (before CreatePeerConnectionFactory).
+///   2. A non-owning raw pointer is retained by WebRTCHostImpl.
+///   3. In WebRTCHostImpl::add_video_track(), set_encoder() is called to inject
+///      the real IEncoder and ID3D11Device before WebRTC's first Create() call.
 ///
-/// Deferred injection pattern: the factory is created in initialize() and
-/// encoder/device are injected via set_pipeline() in add_video_track()
-/// before the first Create() call.
-class AMFVideoEncoderFactory final : public webrtc::VideoEncoderFactory {
+/// Advertises H.264 Baseline (profile-level-id=42e01f) — matches
+/// AMF_VIDEO_ENCODER_PROFILE_BASELINE for minimum decode latency.
+class AMFVideoEncoderFactory : public webrtc::VideoEncoderFactory {
 public:
     AMFVideoEncoderFactory();
     ~AMFVideoEncoderFactory() override;
 
-    /// Called by WebRTCHostImpl::add_video_track() to inject the live pipeline.
-    void set_pipeline(IEncoder* encoder, ID3D11Device* device) noexcept {
-        encoder_ = encoder;
-        device_  = device;
-    }
+    /// Inject the real encoder and D3D11 device.
+    /// Must be called before WebRTC invokes Create().
+    void set_encoder(IEncoder* encoder, ID3D11Device* device);
 
     std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override;
 

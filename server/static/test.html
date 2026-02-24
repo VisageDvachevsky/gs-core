@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GameStream — Stage 3 Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Consolas', 'Courier New', monospace;
+      background: #1e1e1e; color: #d4d4d4;
+      padding: 16px; min-height: 100vh;
+    }
+    h1 { color: #4fc3f7; margin-bottom: 12px; font-size: 18px; }
+    .controls {
+      display: flex; gap: 10px; align-items: center; margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    label { font-size: 13px; }
+    input[type="text"] {
+      background: #2d2d2d; color: #d4d4d4;
+      border: 1px solid #555; padding: 5px 8px;
+      font-family: inherit; font-size: 13px; width: 160px;
+    }
+    button {
+      background: #0e639c; color: #fff;
+      border: none; padding: 6px 14px;
+      cursor: pointer; font-family: inherit; font-size: 13px;
+    }
+    button.secondary { background: #3a3a3a; }
+    button:disabled { background: #444; cursor: default; }
+    button.danger { background: #7e2020; }
+    #status { font-size: 13px; margin-bottom: 8px; color: #4ec9b0; }
+    #stats {
+      background: #1b1b1b; border: 1px solid #444;
+      padding: 8px; margin-bottom: 10px;
+      font-size: 12px; line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    #video-wrap {
+      position: relative;
+      margin-bottom: 10px;
+    }
+    video {
+      width: 100%; max-width: 100%; height: auto; display: block;
+      background: #000; border: 1px solid #444;
+      /* hint for lower-latency playback pipeline (Chromium) */
+      object-fit: contain;
+    }
+    #overlay {
+      position: absolute;
+      left: 6px; top: 6px;
+      background: rgba(0, 0, 0, 0.6);
+      color: #e0e0e0;
+      padding: 6px 8px;
+      border: 1px solid rgba(255,255,255,0.15);
+      font-size: 11px;
+      line-height: 1.35;
+      white-space: pre;
+      pointer-events: none;
+      min-width: 220px;
+    }
+    #log {
+      background: #252526; border: 1px solid #444;
+      padding: 8px; height: 180px; overflow-y: auto;
+      font-size: 12px; line-height: 1.5;
+    }
+    .log-info  { color: #9cdcfe; }
+    .log-ok    { color: #4ec9b0; }
+    .log-warn  { color: #dcdcaa; }
+    .log-error { color: #f48771; }
+  </style>
+</head>
+<body>
+  <h1>GameStream — Stage 3 WebRTC Test</h1>
+
+  <div class="controls">
+    <label>Session: <input id="session-id" type="text" value="a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5"></label>
+    <button id="btn-connect" onclick="connect()">Connect</button>
+    <button id="btn-disconnect" class="danger" onclick="disconnect()" disabled>Disconnect</button>
+    <button id="btn-copy-stats" class="secondary" onclick="copyStats()">Copy stats</button>
+    <label><input id="local-ice" type="checkbox" checked> Local-only ICE</label>
+    <label><input id="filter-virtual" type="checkbox" checked> Filter virtual adapters</label>
+    <label><input id="prefer-fps" type="checkbox" checked> Prefer FPS</label>
+    <label><input id="wake-lock" type="checkbox" checked> Wake Lock</label>
+    <label><input id="host-only" type="checkbox" checked> Host-only ICE</label>
+  </div>
+
+  <div id="status">Idle</div>
+  <div id="stats">Stats: n/a</div>
+  <div id="video-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <div id="overlay">Stats overlay: n/a</div>
+  </div>
+  <div id="log"></div>
+
+  <script>
+    'use strict';
+
+    let pc = null;
+    let statsTimer = null;
+    let statsState = { ts: 0, bytes: 0, framesDecoded: 0, framesReceived: 0 };
+    let lastStatsLogMs = 0;
+    let lastStatsPostMs = 0;
+    let renderState = { ts: 0, frames: 0, fps: 0, total: 0 };
+    let qualityState = { ts: 0, total: 0, dropped: 0 };
+    let videoTrack = null;
+    let wakeLock = null;
+
+    // ------------------------------------------------------------------
+    // Logging helpers
+    // ------------------------------------------------------------------
+    function log(msg, cls = 'log-info') {
+      const div = document.getElementById('log');
+      const row = document.createElement('div');
+      row.className = cls;
+      const now = new Date();
+      const ts = now.toTimeString().slice(0, 8) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      row.textContent = ts + '  ' + msg;
+      div.appendChild(row);
+      div.scrollTop = div.scrollHeight;
+    }
+
+    function setStatus(msg, cls = 'log-info') {
+      document.getElementById('status').textContent = msg;
+      log(msg, cls);
+    }
+
+    function setStatsText(msg) {
+      document.getElementById('stats').textContent = msg;
+      document.getElementById('overlay').textContent = msg;
+    }
+
+    function isPreferFpsEnabled() {
+      return document.getElementById('prefer-fps').checked;
+    }
+
+    function setTrackContentHint(track) {
+      if (!track || typeof track.contentHint === 'undefined') {
+        log('contentHint unsupported', 'log-warn');
+        return;
+      }
+      track.contentHint = isPreferFpsEnabled() ? 'motion' : 'detail';
+      log(`contentHint set to "${track.contentHint}"`, 'log-ok');
+    }
+
+    async function updateWakeLock() {
+      if (!('wakeLock' in navigator)) {
+        log('Wake Lock API unsupported', 'log-warn');
+        return;
+      }
+      if (!document.getElementById('wake-lock').checked) {
+        if (wakeLock) {
+          await wakeLock.release();
+          wakeLock = null;
+          log('Wake Lock released', 'log-warn');
+        }
+        return;
+      }
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => {
+          log('Wake Lock released (system)', 'log-warn');
+        });
+        log('Wake Lock acquired', 'log-ok');
+      } catch (e) {
+        log('Wake Lock failed: ' + e.message, 'log-warn');
+      }
+    }
+
+    async function copyStats() {
+      const stats = document.getElementById('stats').textContent || '';
+      if (!stats || stats === 'Stats: n/a') {
+        log('No stats to copy yet', 'log-warn');
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(stats);
+          log('Stats copied to clipboard', 'log-ok');
+          return;
+        }
+      } catch (e) {
+        // Fallback below.
+      }
+      // Fallback: use a hidden textarea and execCommand (legacy).
+      const ta = document.createElement('textarea');
+      ta.value = stats;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'absolute';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        const ok = document.execCommand('copy');
+        log(ok ? 'Stats copied to clipboard' : 'Copy failed', ok ? 'log-ok' : 'log-warn');
+      } catch (e) {
+        log('Copy failed: ' + e.message, 'log-warn');
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+
+    async function ensureVideoPlayback() {
+      const video = document.getElementById('video');
+      video.muted = true; // make autoplay robust across browsers
+      try {
+        await video.play();
+      } catch (e) {
+        log('video.play() blocked: ' + e.message, 'log-warn');
+      }
+    }
+
+    function startRenderStats(video) {
+      if (typeof video.requestVideoFrameCallback !== 'function') {
+        log('requestVideoFrameCallback not supported', 'log-warn');
+        return;
+      }
+      const cb = (now, metadata) => {
+        const presented = metadata.presentedFrames ?? 0;
+        if (renderState.ts > 0 && presented >= renderState.frames) {
+          const dt = (now - renderState.ts) / 1000;
+          if (dt > 0) {
+            renderState.fps = (presented - renderState.frames) / dt;
+          }
+        }
+        renderState.ts = now;
+        renderState.frames = presented;
+        renderState.total = presented;
+        video.requestVideoFrameCallback(cb);
+      };
+      video.requestVideoFrameCallback(cb);
+      log('Render stats started (requestVideoFrameCallback)', 'log-ok');
+    }
+
+    function filterVirtualCandidates(sdp) {
+      const lines = sdp.split(/\r?\n/);
+      const candidateLines = lines.filter((l) => l.startsWith('a=candidate:'));
+      const keep = candidateLines.filter((l) =>
+        !l.includes('192.168.56.') &&
+        !l.includes('198.18.0.') &&
+        !l.includes('169.254.'));
+
+      if (candidateLines.length === 0 || keep.length === 0) {
+        return { sdp, removed: 0, kept: candidateLines.length };
+      }
+
+      const keepSet = new Set(keep);
+      const filtered = lines.filter((l) => !l.startsWith('a=candidate:') || keepSet.has(l));
+      return { sdp: filtered.join('\r\n'), removed: candidateLines.length - keep.length, kept: keep.length };
+    }
+
+    function filterCandidateTypes(sdp, allowedTypes) {
+      const lines = sdp.split(/\r?\n/);
+      const candidateLines = lines.filter((l) => l.startsWith('a=candidate:'));
+      if (candidateLines.length === 0) {
+        return { sdp, removed: 0, kept: 0 };
+      }
+      const keep = candidateLines.filter((l) => {
+        const match = l.match(/ typ ([a-z]+)/);
+        if (!match) return false;
+        return allowedTypes.includes(match[1]);
+      });
+      if (keep.length === 0) {
+        return { sdp, removed: 0, kept: candidateLines.length, warning: 'no_allowed_candidates' };
+      }
+      const keepSet = new Set(keep);
+      const filtered = lines.filter((l) => !l.startsWith('a=candidate:') || keepSet.has(l));
+      return { sdp: filtered.join('\r\n'), removed: candidateLines.length - keep.length, kept: keep.length };
+    }
+
+    function applySdpFilters(label, sdp) {
+      let updated = sdp;
+      if (document.getElementById('filter-virtual').checked) {
+        const filtered = filterVirtualCandidates(updated);
+        if (filtered.removed > 0) {
+          log(`${label}: filtered ${filtered.removed} virtual candidates`, 'log-ok');
+          updated = filtered.sdp;
+        }
+      }
+      if (document.getElementById('host-only').checked) {
+        const filtered = filterCandidateTypes(updated, ['host']);
+        if (filtered.warning === 'no_allowed_candidates') {
+          log(`${label}: no host candidates found`, 'log-warn');
+        } else if (filtered.removed > 0) {
+          log(`${label}: removed ${filtered.removed} non-host candidates`, 'log-ok');
+          updated = filtered.sdp;
+        }
+      }
+      return updated;
+    }
+
+    async function pollStats() {
+      if (!pc) return;
+      let stats;
+      try {
+        stats = await pc.getStats();
+      } catch (e) {
+        log('getStats() failed: ' + e.message, 'log-warn');
+        return;
+      }
+
+      let inbound = null;
+      let track = null;
+      let candidatePair = null;
+      let transport = null;
+      let localCandidate = null;
+      let remoteCandidate = null;
+      stats.forEach((report) => {
+        if (report.type === 'inbound-rtp' &&
+            (report.kind === 'video' || report.mediaType === 'video')) {
+          inbound = report;
+        }
+        if (report.type === 'track' && report.kind === 'video') {
+          track = report;
+        }
+        if (report.type === 'candidate-pair') {
+          if (report.selected || report.nominated || report.state === 'succeeded') {
+            if (!candidatePair || report.selected || report.nominated) {
+              candidatePair = report;
+            }
+          }
+        }
+        if (report.type === 'transport' && report.selectedCandidatePairId) {
+          transport = report;
+        }
+      });
+      if (!inbound) return;
+
+      const nowMs = inbound.timestamp || performance.now();
+      const framesDecoded = inbound.framesDecoded ?? inbound.framesReceived ?? 0;
+      const bytes = inbound.bytesReceived ?? 0;
+      const width = inbound.frameWidth ?? 0;
+      const height = inbound.frameHeight ?? 0;
+      const jitterMs = inbound.jitter ? inbound.jitter * 1000 : 0;
+      const packetsLost = inbound.packetsLost ?? 0;
+      const keyframes = inbound.keyFramesDecoded ?? 0;
+      const framesDropped = inbound.framesDropped ?? 0;
+      const framesReceived = inbound.framesReceived ?? 0;
+      const totalDecodeTime = inbound.totalDecodeTime ?? 0;
+      const totalInterDelay = inbound.totalInterFrameDelay ?? 0;
+      const jitterBufferDelay = inbound.jitterBufferDelay ?? 0;
+      const jitterBufferEmittedCount = inbound.jitterBufferEmittedCount ?? 0;
+
+      let fps = inbound.framesPerSecond;
+      let fpsDecoded = null;
+      let fpsReceived = null;
+      let bitrateKbps = 0;
+      if (statsState.ts > 0) {
+        const dt = (nowMs - statsState.ts) / 1000;
+        if (!fps && dt > 0) {
+          fps = (framesDecoded - statsState.framesDecoded) / dt;
+        }
+        if (dt > 0) {
+          fpsDecoded = (framesDecoded - statsState.framesDecoded) / dt;
+          fpsReceived = (framesReceived - statsState.framesReceived) / dt;
+        }
+        if (dt > 0) {
+          bitrateKbps = (8 * (bytes - statsState.bytes)) / dt / 1000;
+        }
+      }
+      statsState = { ts: nowMs, bytes, framesDecoded, framesReceived };
+
+      const video = document.getElementById('video');
+      const elemW = video.videoWidth || 0;
+      const elemH = video.videoHeight || 0;
+      const fpsText = (typeof fps === 'number' && isFinite(fps)) ? fps.toFixed(1) : 'n/a';
+      const fpsDecodedText = (typeof fpsDecoded === 'number' && isFinite(fpsDecoded))
+        ? fpsDecoded.toFixed(1) : 'n/a';
+      const fpsReceivedText = (typeof fpsReceived === 'number' && isFinite(fpsReceived))
+        ? fpsReceived.toFixed(1) : 'n/a';
+      const kbpsText = (bitrateKbps > 0) ? bitrateKbps.toFixed(0) : 'n/a';
+
+      let avgDecodeMs = 'n/a';
+      if (framesDecoded > 0 && totalDecodeTime > 0) {
+        avgDecodeMs = ((totalDecodeTime / framesDecoded) * 1000).toFixed(2);
+      }
+      let avgInterDelayMs = 'n/a';
+      if (framesDecoded > 0 && totalInterDelay > 0) {
+        avgInterDelayMs = ((totalInterDelay / framesDecoded) * 1000).toFixed(2);
+      }
+      let avgJitterBufferMs = 'n/a';
+      if (jitterBufferEmittedCount > 0 && jitterBufferDelay > 0) {
+        avgJitterBufferMs = ((jitterBufferDelay / jitterBufferEmittedCount) * 1000).toFixed(2);
+      }
+
+      let rttMs = 'n/a';
+      let availableInKbps = 'n/a';
+      if (candidatePair) {
+        if (candidatePair.currentRoundTripTime !== undefined) {
+          rttMs = (candidatePair.currentRoundTripTime * 1000).toFixed(1);
+        }
+        if (candidatePair.availableIncomingBitrate !== undefined) {
+          availableInKbps = (candidatePair.availableIncomingBitrate / 1000).toFixed(0);
+        }
+        if (candidatePair.localCandidateId) {
+          localCandidate = stats.get(candidatePair.localCandidateId);
+        }
+        if (candidatePair.remoteCandidateId) {
+          remoteCandidate = stats.get(candidatePair.remoteCandidateId);
+        }
+      } else if (transport && transport.selectedCandidatePairId) {
+        const pair = stats.get(transport.selectedCandidatePairId);
+        if (pair && pair.currentRoundTripTime !== undefined) {
+          rttMs = (pair.currentRoundTripTime * 1000).toFixed(1);
+        }
+      }
+
+      const localAddr = localCandidate
+        ? `${localCandidate.ip || localCandidate.address || 'n/a'}:${localCandidate.port || 'n/a'} (${localCandidate.candidateType || 'n/a'})`
+        : 'n/a';
+      const remoteAddr = remoteCandidate
+        ? `${remoteCandidate.ip || remoteCandidate.address || 'n/a'}:${remoteCandidate.port || 'n/a'} (${remoteCandidate.candidateType || 'n/a'})`
+        : 'n/a';
+
+      const renderFpsText = (renderState.fps && isFinite(renderState.fps))
+        ? renderState.fps.toFixed(1) : 'n/a';
+      const renderFramesText = renderState.total || 0;
+      const visibility = document.visibilityState;
+
+      let qualityLine = 'Video quality: n/a';
+      if (typeof video.getVideoPlaybackQuality === 'function') {
+        const q = video.getVideoPlaybackQuality();
+        qualityLine = `Video quality: total=${q.totalVideoFrames} dropped=${q.droppedVideoFrames} corrupted=${q.corruptedVideoFrames}`;
+        if (qualityState.ts > 0) {
+          const dt = (performance.now() - qualityState.ts) / 1000;
+          const droppedDelta = q.droppedVideoFrames - qualityState.dropped;
+          const totalDelta = q.totalVideoFrames - qualityState.total;
+          const dropRate = dt > 0 ? (droppedDelta / dt) : 0;
+          const dropPct = totalDelta > 0 ? (100 * droppedDelta / totalDelta) : 0;
+          qualityLine += ` | dropRate=${dropRate.toFixed(1)}/s (${dropPct.toFixed(1)}%)`;
+        }
+        qualityState = {
+          ts: performance.now(),
+          total: q.totalVideoFrames,
+          dropped: q.droppedVideoFrames
+        };
+      }
+
+      const trackWidth = track?.frameWidth ?? 0;
+      const trackHeight = track?.frameHeight ?? 0;
+      const trackFps = track?.framesPerSecond ?? 0;
+
+      setStatsText(
+        `Inbound RTP: ${width}x${height} | fps(stat)=${fpsText} | fps(recv)=${fpsReceivedText} | fps(dec)=${fpsDecodedText} | bitrate=${kbpsText} kbps\n` +
+        `Decoded: ${framesDecoded} | received=${framesReceived} | dropped=${framesDropped} | keyframes=${keyframes}\n` +
+        `Decode: avg=${avgDecodeMs} ms | inter=${avgInterDelayMs} ms | jitter=${jitterMs.toFixed(1)} ms\n` +
+        `JitterBuffer: avg=${avgJitterBufferMs} ms | lost=${packetsLost} | rtt=${rttMs} ms | availIn=${availableInKbps} kbps\n` +
+        `Track: ${trackWidth}x${trackHeight} @ ${trackFps || 'n/a'} fps\n` +
+        `Render: fps=${renderFpsText} | frames=${renderFramesText}\n` +
+        `Video element: ${elemW}x${elemH} | readyState=${video.readyState}\n` +
+        `ICE: local=${localAddr} | remote=${remoteAddr}\n` +
+        `Page: ${visibility}\n` +
+        `${qualityLine}`
+      );
+
+      const now = performance.now();
+      if (now - lastStatsLogMs > 5000) {
+        lastStatsLogMs = now;
+        log(`Stats: ${width}x${height} fps=${fpsText} kbps=${kbpsText} ` +
+            `drop=${framesDropped} lost=${packetsLost} rtt=${rttMs}ms`, 'log-info');
+      }
+
+      if (now - lastStatsPostMs > 5000) {
+        lastStatsPostMs = now;
+        const sessionId = document.getElementById('session-id').value.trim();
+        const payload = {
+          session_id: sessionId,
+          timestamp_ms: Date.now(),
+          inbound: {
+            width, height, fps: fpsText, bitrate_kbps: kbpsText,
+            frames_decoded: framesDecoded, frames_received: framesReceived,
+            frames_dropped: framesDropped, keyframes,
+            packets_lost: packetsLost, jitter_ms: jitterMs,
+            avg_decode_ms: avgDecodeMs, avg_inter_ms: avgInterDelayMs,
+            avg_jitter_buffer_ms: avgJitterBufferMs,
+            rtt_ms: rttMs, avail_in_kbps: availableInKbps
+          },
+          track: { width: trackWidth, height: trackHeight, fps: trackFps || 'n/a' },
+          video: { width: elemW, height: elemH, ready_state: video.readyState }
+        };
+        fetch('/api/client/stats', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }).catch(() => {});
+      }
+    }
+
+    function startStats() {
+      if (statsTimer) return;
+      statsState = { ts: 0, bytes: 0, framesDecoded: 0, framesReceived: 0 };
+      lastStatsLogMs = 0;
+      statsTimer = setInterval(pollStats, 1000);
+      log('Stats polling started (1s)', 'log-ok');
+    }
+
+    function stopStats() {
+      if (!statsTimer) return;
+      clearInterval(statsTimer);
+      statsTimer = null;
+      setStatsText('Stats: n/a');
+      log('Stats polling stopped', 'log-warn');
+    }
+
+    // ------------------------------------------------------------------
+    // Connect
+    // ------------------------------------------------------------------
+    async function connect() {
+      const sessionId = document.getElementById('session-id').value.trim() || 'test-session';
+      document.getElementById('btn-connect').disabled = true;
+      setStatus('Fetching offer from server…');
+
+      try {
+        // 1. Fetch offer (server long-polls up to 30 s for the C++ host offer).
+        const offerResp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/offer`);
+        if (!offerResp.ok) {
+          throw new Error(`GET /offer failed: HTTP ${offerResp.status}`);
+        }
+        const offer = await offerResp.json();
+        log(`Offer received: type=${offer.type}, ${offer.sdp.length} chars`);
+
+        // 2. Create PeerConnection (local-only ICE for LAN loopback tests).
+        const localOnly = document.getElementById('local-ice').checked;
+        const iceServers = localOnly ? [] : [{ urls: 'stun:stun.l.google.com:19302' }];
+        pc = new RTCPeerConnection({ iceServers });
+        if (localOnly) {
+          log('Local-only ICE enabled (no STUN)', 'log-ok');
+        }
+
+        pc.onconnectionstatechange = () => {
+          const s = pc.connectionState;
+          const cls = s === 'connected' ? 'log-ok'
+                    : s === 'failed'    ? 'log-error'
+                    : 'log-info';
+          setStatus('PeerConnection: ' + s, cls);
+          if (s === 'connected') {
+            document.getElementById('btn-disconnect').disabled = false;
+            startStats();
+          }
+          if (s === 'failed' || s === 'closed') {
+            document.getElementById('btn-connect').disabled = false;
+            stopStats();
+          }
+        };
+        pc.oniceconnectionstatechange = () =>
+          log('ICE connection: ' + pc.iceConnectionState);
+
+        // 3. Attach incoming video stream.
+        pc.ontrack = (event) => {
+          log(`Track received: kind=${event.track.kind}`, 'log-ok');
+          if (event.track.kind === 'video') {
+            // Minimize jitter buffer: for LAN streaming buffering only adds latency.
+            // jitterBufferTarget=0 is available in Chromium 107+.
+            if (typeof event.receiver.jitterBufferTarget !== 'undefined') {
+              event.receiver.jitterBufferTarget = 0;
+              log('jitterBufferTarget set to 0ms', 'log-ok');
+            } else {
+              log('jitterBufferTarget unsupported', 'log-warn');
+            }
+            if (typeof event.receiver.setJitterBufferMinimumDelay === 'function') {
+              event.receiver.setJitterBufferMinimumDelay(0);
+              log('jitterBufferMinimumDelay set to 0ms', 'log-ok');
+            } else {
+              log('jitterBufferMinimumDelay unsupported', 'log-warn');
+            }
+            videoTrack = event.track;
+            setTrackContentHint(videoTrack);
+            if (typeof event.track.getSettings === 'function') {
+              const settings = event.track.getSettings();
+              log(`Track settings: ${JSON.stringify(settings)}`, 'log-ok');
+            }
+            if (typeof event.receiver.playoutDelayHint !== 'undefined') {
+              event.receiver.playoutDelayHint = 0;
+              log('playoutDelayHint set to 0ms', 'log-ok');
+            } else {
+              log('playoutDelayHint unsupported', 'log-warn');
+            }
+
+            const video = document.getElementById('video');
+            video.srcObject = event.streams[0];
+            // latencyHint=0 requests minimal buffering in the media pipeline.
+            // Only applies to MediaSource; for WebRTC srcObject it is a no-op
+            // in current browsers, but harmless to set.
+            video.onloadedmetadata = () => {
+              log(`Video resolution: ${video.videoWidth}x${video.videoHeight}`, 'log-ok');
+              void ensureVideoPlayback();
+              startRenderStats(video);
+            };
+            void ensureVideoPlayback();
+            startStats();
+            void updateWakeLock();
+          }
+        };
+
+        // 4. Optionally filter virtual adapter candidates, then set remote description.
+        offer.sdp = applySdpFilters('Offer SDP', offer.sdp);
+        await pc.setRemoteDescription(offer);
+        log('Remote description set');
+
+        // 5. Create answer.
+        const answer = await pc.createAnswer();
+        answer.sdp = applySdpFilters('Answer SDP', answer.sdp);
+        await pc.setLocalDescription(answer);
+        log('Local description set, waiting for ICE gathering…');
+
+        // 6. Wait for ICE gathering complete (non-trickle — embed all candidates).
+        await new Promise((resolve) => {
+          if (pc.iceGatheringState === 'complete') { resolve(); return; }
+          pc.addEventListener('icegatheringstatechange', function handler() {
+            log('ICE gathering: ' + pc.iceGatheringState);
+            if (pc.iceGatheringState === 'complete') {
+              pc.removeEventListener('icegatheringstatechange', handler);
+              resolve();
+            }
+          });
+        });
+
+        // 7. POST answer to signaling server.
+        const local = pc.localDescription;
+        const answerResp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/answer`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ type: local.type, sdp: local.sdp })
+        });
+        if (!answerResp.ok) {
+          throw new Error(`POST /answer failed: HTTP ${answerResp.status}`);
+        }
+        setStatus('Answer sent — connecting…', 'log-ok');
+
+      } catch (e) {
+        log('Error: ' + e.message, 'log-error');
+        setStatus('Error: ' + e.message, 'log-error');
+        document.getElementById('btn-connect').disabled = false;
+        if (pc) { pc.close(); pc = null; }
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Disconnect
+    // ------------------------------------------------------------------
+    function disconnect() {
+      if (pc) { pc.close(); pc = null; }
+      document.getElementById('video').srcObject = null;
+      videoTrack = null;
+      void updateWakeLock();
+      stopStats();
+      setStatus('Disconnected');
+      document.getElementById('btn-connect').disabled    = false;
+      document.getElementById('btn-disconnect').disabled = true;
+    }
+
+    document.getElementById('prefer-fps').addEventListener('change', () => {
+      setTrackContentHint(videoTrack);
+    });
+    document.getElementById('wake-lock').addEventListener('change', () => {
+      void updateWakeLock();
+    });
+    document.addEventListener('visibilitychange', () => {
+      log('Page visibility: ' + document.visibilityState, 'log-info');
+    });
+  </script>
+</body>
+</html>

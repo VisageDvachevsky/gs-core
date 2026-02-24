@@ -8,6 +8,31 @@ using Microsoft::WRL::ComPtr;
 
 namespace gamestream {
 
+namespace {
+
+std::string wide_to_utf8(const wchar_t* text) {
+    if (!text || *text == L'\0') {
+        return {};
+    }
+
+    const int needed_with_nul =
+        WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (needed_with_nul <= 1) {
+        return {};
+    }
+
+    std::string out(static_cast<size_t>(needed_with_nul), '\0');
+    const int written = WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(),
+                                            needed_with_nul, nullptr, nullptr);
+    if (written <= 0) {
+        return {};
+    }
+    out.resize(static_cast<size_t>(written - 1));
+    return out;
+}
+
+} // namespace
+
 DXGICapture::~DXGICapture() {
     if (frame_acquired_) {
         release_frame();
@@ -38,8 +63,8 @@ VoidResult DXGICapture::initialize_with_config(const CaptureConfig& config) {
     return {};
 }
 
-bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
-    ComPtr<IDXGIFactory1> factory;
+bool DXGICapture::find_adapter(uint32_t adapter_index, bool find_amd,
+                               ComPtr<IDXGIFactory1>& factory) {
     HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), &factory);
     if (FAILED(hr)) {
         spdlog::error("[DXGI] CreateDXGIFactory1 failed: 0x{:08X}", static_cast<uint32_t>(hr));
@@ -53,34 +78,27 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
 
-        // Convert WCHAR description to UTF-8 for spdlog (no SPDLOG_WCHAR_TO_UTF8_SUPPORT needed)
-        const int needed = WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
-                                               nullptr, 0, nullptr, nullptr);
-        std::string desc_utf8(static_cast<size_t>(needed), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
-                            desc_utf8.data(), needed, nullptr, nullptr);
+        const std::string desc_utf8 = wide_to_utf8(desc.Description);
 
         spdlog::debug("[DXGI] Adapter {}: {} (VendorID: 0x{:04X})", i, desc_utf8, desc.VendorId);
 
         if (find_amd && desc.VendorId == 0x1002) {  // AMD vendor ID
             spdlog::info("[DXGI] Found AMD GPU: {} (adapter {})", desc_utf8, i);
             adapter_ = adapter;
-            break;
+            return true;
         }
-
         if (!find_amd && current_index == adapter_index) {
             adapter_ = adapter;
-            break;
+            return true;
         }
-
         current_index++;
     }
 
-    if (!adapter_) {
-        spdlog::error("[DXGI] No suitable adapter found");
-        return false;
-    }
+    spdlog::error("[DXGI] No suitable adapter found");
+    return false;
+}
 
+bool DXGICapture::create_d3d11_device_from_adapter() {
     D3D_FEATURE_LEVEL feature_levels[] = {
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0
@@ -93,7 +111,7 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
     create_flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
-    hr = D3D11CreateDevice(
+    HRESULT hr = D3D11CreateDevice(
         adapter_.Get(),
         D3D_DRIVER_TYPE_UNKNOWN,  // Must be UNKNOWN when an explicit adapter is provided
         nullptr,
@@ -105,18 +123,43 @@ bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
         &feature_level,
         &context_
     );
-
     if (FAILED(hr)) {
         spdlog::error("[DXGI] D3D11CreateDevice failed: 0x{:08X}", static_cast<uint32_t>(hr));
         return false;
     }
-
     spdlog::debug("[DXGI] D3D11 device created successfully");
     return true;
 }
 
+bool DXGICapture::create_device(uint32_t adapter_index, bool find_amd) {
+    ComPtr<IDXGIFactory1> factory;
+    if (!find_adapter(adapter_index, find_amd, factory)) {
+        return false;
+    }
+    return create_d3d11_device_from_adapter();
+}
+
 bool DXGICapture::create_duplication(uint32_t output_index) {
-    // EnumOutputs returns IDXGIOutput; QueryInterface up to IDXGIOutput5 for DuplicateOutput1.
+    DXGI_OUTPUT_DESC output_desc{};
+    std::string device_name_utf8;
+    if (!open_output(output_index, output_desc, device_name_utf8)) {
+        return false;
+    }
+
+    log_output_desc(output_desc, device_name_utf8);
+    update_output_size(output_desc);
+    log_refresh_rate();
+
+    if (!create_output_duplication()) {
+        return false;
+    }
+
+    spdlog::debug("[DXGI] Desktop duplication created successfully");
+    return true;
+}
+
+bool DXGICapture::open_output(uint32_t output_index, DXGI_OUTPUT_DESC& desc,
+                              std::string& name_utf8) {
     ComPtr<IDXGIOutput> output;
     HRESULT hr = adapter_->EnumOutputs(output_index, &output);
     if (FAILED(hr)) {
@@ -126,51 +169,50 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
 
     hr = output.As(&output_);
     if (FAILED(hr)) {
-        spdlog::error("[DXGI] QueryInterface to IDXGIOutput5 failed: 0x{:08X}", static_cast<uint32_t>(hr));
+        spdlog::error("[DXGI] QueryInterface to IDXGIOutput5 failed: 0x{:08X}",
+                      static_cast<uint32_t>(hr));
         return false;
     }
 
-    DXGI_OUTPUT_DESC output_desc;
-    output_->GetDesc(&output_desc);
+    output_->GetDesc(&desc);
+    name_utf8 = wide_to_utf8(desc.DeviceName);
+    return true;
+}
 
-    // Convert WCHAR device name to UTF-8 for spdlog
-    const int needed = WideCharToMultiByte(CP_UTF8, 0, output_desc.DeviceName, -1,
-                                           nullptr, 0, nullptr, nullptr);
-    std::string device_name_utf8(static_cast<size_t>(needed), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, output_desc.DeviceName, -1,
-                        device_name_utf8.data(), needed, nullptr, nullptr);
-
+void DXGICapture::log_output_desc(const DXGI_OUTPUT_DESC& desc,
+                                  const std::string& name_utf8) const {
     spdlog::debug("[DXGI] Output: {} at ({}, {}) to ({}, {})",
-                  device_name_utf8,
-                  output_desc.DesktopCoordinates.left,
-                  output_desc.DesktopCoordinates.top,
-                  output_desc.DesktopCoordinates.right,
-                  output_desc.DesktopCoordinates.bottom);
+                  name_utf8,
+                  desc.DesktopCoordinates.left,
+                  desc.DesktopCoordinates.top,
+                  desc.DesktopCoordinates.right,
+                  desc.DesktopCoordinates.bottom);
+}
 
-    width_  = static_cast<uint32_t>(
-        output_desc.DesktopCoordinates.right - output_desc.DesktopCoordinates.left);
-    height_ = static_cast<uint32_t>(
-        output_desc.DesktopCoordinates.bottom - output_desc.DesktopCoordinates.top);
+void DXGICapture::update_output_size(const DXGI_OUTPUT_DESC& desc) {
+    width_  = static_cast<uint32_t>(desc.DesktopCoordinates.right - desc.DesktopCoordinates.left);
+    height_ = static_cast<uint32_t>(desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
+}
 
-    // Query monitor refresh rate for informational logging
+void DXGICapture::log_refresh_rate() const {
     DXGI_MODE_DESC mode_desc{};
     mode_desc.Width  = width_;
     mode_desc.Height = height_;
     mode_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     DXGI_MODE_DESC closest_mode{};
-    hr = output_->FindClosestMatchingMode(&mode_desc, &closest_mode, nullptr);
+    HRESULT hr = output_->FindClosestMatchingMode(&mode_desc, &closest_mode, nullptr);
     if (SUCCEEDED(hr)) {
-        double refresh_rate = static_cast<double>(closest_mode.RefreshRate.Numerator)
-                            / closest_mode.RefreshRate.Denominator;
+        const double refresh_rate =
+            static_cast<double>(closest_mode.RefreshRate.Numerator)
+            / closest_mode.RefreshRate.Denominator;
         spdlog::info("[DXGI] Monitor refresh rate: {:.2f} Hz", refresh_rate);
     }
+}
 
-    // Try DuplicateOutput1 (DXGI 1.5) with explicit BGRA format first.
-    // Falls back to DuplicateOutput (DXGI 1.2) if the driver returns UNSUPPORTED
-    // (e.g. HDR mode, some AMD configurations, certain remote session types).
+bool DXGICapture::create_output_duplication() {
     DXGI_FORMAT formats[] = { DXGI_FORMAT_B8G8R8A8_UNORM };
-    hr = output_->DuplicateOutput1(device_.Get(), 0, 1, formats, &duplication_);
+    HRESULT hr = output_->DuplicateOutput1(device_.Get(), 0, 1, formats, &duplication_);
 
     if (hr == DXGI_ERROR_UNSUPPORTED) {
         spdlog::warn("[DXGI] DuplicateOutput1 unsupported (HDR/driver limitation), falling back to DuplicateOutput");
@@ -186,8 +228,6 @@ bool DXGICapture::create_duplication(uint32_t output_index) {
         }
         return false;
     }
-
-    spdlog::debug("[DXGI] Desktop duplication created successfully");
     return true;
 }
 

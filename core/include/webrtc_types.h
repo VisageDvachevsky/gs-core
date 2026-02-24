@@ -168,6 +168,14 @@ struct IceServer {
 struct WebRTCConfig {
     std::vector<IceServer> ice_servers;
     std::string input_channel_label = "input";
+    int         ice_backup_candidate_pair_ping_interval_ms = 1000;
+    int         ice_connection_receiving_timeout_ms = 10000;
+    // Sender-side RTP limits applied via RtpSender::SetParameters.
+    int         video_max_framerate = 60;
+    int         video_min_bitrate_bps = 2'000'000;
+    int         video_max_bitrate_bps = 15'000'000;
+    // true = keep resolution/frame-rate fixed (disable adaptation).
+    bool        disable_video_adaptation = false;
 };
 
 } // namespace gamestream

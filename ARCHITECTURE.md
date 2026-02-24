@@ -1,6 +1,6 @@
 # 🧠 GameStream — Архитектура системы
 
-**Status**: Pre-Development Architecture Planning (PHASE 0)
+**Status**: Development (PHASE 3: WebRTC & Signaling)
 **Target**: Death Stranding @ 1080p60 WebRTC with <80ms latency
 
 ---
@@ -18,7 +18,7 @@ CLIENT (Browser)
         ↕️ WebRTC (UDP, +25–45ms internet latency)
 SERVER (Your PC)
 ├─ Streaming Core (C++20)
-│  ├─ DXGI Output Duplication (GPU capture <2ms)
+│  ├─ WGC / DXGI Capture (GPU capture <2ms)
 │  ├─ AMD AMF H.264 Encoder (5–8ms encode)
 │  ├─ libwebrtc (RTP transport)
 │  └─ SendInput() / Raw Input (control injection)
@@ -33,7 +33,7 @@ SERVER (Your PC)
 ### Critical Path Analysis
 
 **Video latency (capture → display)**:
-- DXGI Poll: 0.5–1 ms (GPU operation)
+- WGC/DXGI Poll: 0.5–1 ms (GPU operation)
 - AMF Encode: 5–8 ms (H.264 VCN 3.0)
 - RTP Packetization: 0.1 ms
 - Network: 25–45 ms (Moscow↔Europe distance)
@@ -58,7 +58,7 @@ SERVER (Your PC)
 
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
-| Video Capture | DXGI DuplicateOutput | Only Windows API with <2ms latency |
+| Video Capture | WGC / DXGI | WGC for windows, DXGI as fallback. <2ms latency |
 | GPU Encoder | AMD AMF H.264 | VCN 3.0: 1-frame latency vs NVENC (2–3) |
 | WebRTC | libwebrtc native C++ | Zero-copy RTP payload |
 | Input | SendInput() + Raw Input | <0.1ms Windows API |
@@ -83,9 +83,9 @@ SERVER (Your PC)
 
 | Phase | Goal | Time | Status |
 |-------|------|------|--------|
-| 1 | Local DXGI + AMF capture PoC | 1–2 weeks | 🟡 Ready |
-| 2 | WebRTC integration (localhost) | 1–2 weeks | 📋 Next |
-| 3 | Signaling server (internet ready) | 3–5 days | 📋 Later |
+| 1 | Local DXGI + AMF capture PoC | 1–2 weeks | ✅ Done |
+| 2 | WebRTC integration (localhost) | 1–2 weeks | ✅ Done |
+| 3 | Signaling server (internet ready) | 3–5 days | 🟡 In Progress |
 | 4 | Web client UI | 3–5 days | 📋 Later |
 | 5 | Optimization + monitoring | 2+ weeks | 📋 Later |
 
@@ -95,7 +95,7 @@ SERVER (Your PC)
 
 | Constraint | Impact | Mitigation |
 |-----------|--------|-----------|
-| DXGI only works in Windowed mode | Must use Borderless (perf -15%) | Death Stranding supports it |
+| DXGI only works in Windowed mode | Must use Borderless (perf -15%) | WGC helps with per-window capture |
 | libwebrtc large compilation (1+ GB) | Build time 20–40 min | Cache artifacts in CI |
 | AMF only on AMD GPU | Future: add NVIDIA/Intel layer | PHASE 6+ abstraction |
 | SendInput() blocked by some AC | Death Stranding OK | Accept for MVP |
