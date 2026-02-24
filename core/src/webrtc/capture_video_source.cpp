@@ -28,11 +28,18 @@ void advance_pacer(uint32_t& rtp_timestamp,
 }
 
 webrtc::ColorSpace make_desktop_color_space() {
-    // ARGBToI420 uses BT.601 limited-range coefficients.
+    // Desktop content is sRGB (BT.709 primaries/transfer).  AMF H.264 encoder
+    // uses BT.709 limited-range matrix for HD (>=720p) input by default.
+    // Declaring the same here ensures the browser applies the correct YUV→RGB
+    // matrix via the RTP color-space header extension.
+    //
+    // NOTE: the intermediate I420 buffer (ARGBToI420 / I420ToARGB) uses
+    // libyuv BT.601, but that round-trip is cancelled before reaching AMF —
+    // it only affects the CPU-side scratch buffer, not the final H.264 stream.
     return webrtc::ColorSpace(
-        webrtc::ColorSpace::PrimaryID::kSMPTE170M,
-        webrtc::ColorSpace::TransferID::kSMPTE170M,
-        webrtc::ColorSpace::MatrixID::kSMPTE170M,
+        webrtc::ColorSpace::PrimaryID::kBT709,
+        webrtc::ColorSpace::TransferID::kBT709,
+        webrtc::ColorSpace::MatrixID::kBT709,
         webrtc::ColorSpace::RangeID::kLimited);
 }
 
@@ -220,7 +227,11 @@ void CaptureVideoSource::capture_loop() {
             std::this_thread::sleep_for(next_emit_deadline - now);
         }
 
-        auto frame_res = capture_->acquire_frame(16);
+        // 8 ms = ~half a frame at 60 fps.  Keeping the timeout well below the
+        // 16.67 ms frame interval prevents acquire_frame from eating into the
+        // next slot: if the capture backend is slow, we emit the previous frame
+        // as fallback and stay on pace rather than slipping to ~30 fps.
+        auto frame_res = capture_->acquire_frame(8);
         bool emitted_fallback = false;
         if (handle_acquire_failure(frame_res, last_i420, rtp_timestamp, desktop_color_space,
                                    invalid_result_logged, emitted_fallback)) {

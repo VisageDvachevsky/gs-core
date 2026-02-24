@@ -466,6 +466,21 @@ VoidResult WebRTCHostImpl::add_video_track(IFrameCapture* capture, IEncoder* enc
         return VoidResult::error("Failed to add video transceiver to PeerConnection");
     }
 
+    // Enforce 60 fps cap so WebRTC's congestion controller does not silently
+    // reduce the frame rate below the capture rate.
+    {
+        auto sender = res.value()->sender();
+        webrtc::RtpParameters params = sender->GetParameters();
+        for (auto& enc : params.encodings) {
+            enc.max_framerate = 60;
+        }
+        webrtc::RTCError set_err = sender->SetParameters(params);
+        if (!set_err.ok()) {
+            spdlog::warn("[WebRTCHost] SetParameters(max_framerate=60) failed: {}",
+                         set_err.message());
+        }
+    }
+
     video_source_->start();
     spdlog::info("[WebRTCHost] Video track added, capture started");
     return VoidResult();

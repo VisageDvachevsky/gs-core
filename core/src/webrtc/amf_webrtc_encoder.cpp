@@ -208,6 +208,15 @@ int32_t AMFVideoEncoder::Encode(const webrtc::VideoFrame&                  frame
                                      ? webrtc::VideoFrameType::kVideoFrameKey
                                      : webrtc::VideoFrameType::kVideoFrameDelta;
 
+    // Explicitly propagate BT.709 limited-range so the browser's RTP decoder
+    // uses the correct YUV→RGB matrix — matches AMF's default for HD content.
+    static const webrtc::ColorSpace kBT709Limited(
+        webrtc::ColorSpace::PrimaryID::kBT709,
+        webrtc::ColorSpace::TransferID::kBT709,
+        webrtc::ColorSpace::MatrixID::kBT709,
+        webrtc::ColorSpace::RangeID::kLimited);
+    encoded_image.SetColorSpace(kBT709Limited);
+
     const webrtc::CodecSpecificInfo codec_specific =
         make_h264_codec_specific_info(encoded->is_keyframe);
 

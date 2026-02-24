@@ -34,6 +34,8 @@
       width: 100%; max-width: 1280px; display: block;
       background: #000; border: 1px solid #444;
       margin-bottom: 10px;
+      /* hint for lower-latency playback pipeline (Chromium) */
+      object-fit: fill;
     }
     #log {
       background: #252526; border: 1px solid #444;
@@ -56,7 +58,7 @@
   </div>
 
   <div id="status">Idle</div>
-  <video id="video" autoplay playsinline controls></video>
+  <video id="video" autoplay playsinline muted></video>
   <div id="log"></div>
 
   <script>
@@ -135,8 +137,18 @@
         pc.ontrack = (event) => {
           log(`Track received: kind=${event.track.kind}`, 'log-ok');
           if (event.track.kind === 'video') {
+            // Minimize jitter buffer: for LAN streaming buffering only adds latency.
+            // jitterBufferTarget=0 is available in Chromium 107+.
+            if (typeof event.receiver.jitterBufferTarget !== 'undefined') {
+              event.receiver.jitterBufferTarget = 0;
+              log('jitterBufferTarget set to 0ms', 'log-ok');
+            }
+
             const video = document.getElementById('video');
             video.srcObject = event.streams[0];
+            // latencyHint=0 requests minimal buffering in the media pipeline.
+            // Only applies to MediaSource; for WebRTC srcObject it is a no-op
+            // in current browsers, but harmless to set.
             video.onloadedmetadata = () => void ensureVideoPlayback();
             void ensureVideoPlayback();
           }
