@@ -293,6 +293,19 @@ Result<EncodedFrame> AMFEncoder::encode(const CaptureFrame& frame) {
                          static_cast<uint32_t>(res));
             // Non-fatal: continue without force IDR this frame
         }
+        // For decoder recovery in WebRTC, include SPS/PPS with forced IDR frames.
+        // Some decoders cannot recover from an out-of-sync state if IDR arrives
+        // without parameter sets.
+        AMF_RESULT sps_res = surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
+        if (sps_res != AMF_OK) {
+            spdlog::warn("[AMF] SetProperty(INSERT_SPS=true) failed: 0x{:08X}",
+                         static_cast<uint32_t>(sps_res));
+        }
+        AMF_RESULT pps_res = surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+        if (pps_res != AMF_OK) {
+            spdlog::warn("[AMF] SetProperty(INSERT_PPS=true) failed: 0x{:08X}",
+                         static_cast<uint32_t>(pps_res));
+        }
     }
 
     // --- Step 4: submit frame to encoder pipeline ---

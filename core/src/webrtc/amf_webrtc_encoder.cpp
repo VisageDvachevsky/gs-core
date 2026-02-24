@@ -5,6 +5,8 @@
 #pragma warning(disable: 4100 4245 4267)
 #include <rtc_base/time_utils.h>
 #include <modules/video_coding/include/video_error_codes.h>
+#include <modules/video_coding/include/video_codec_interface.h>
+#include <modules/video_coding/codecs/interface/common_constants.h>
 #pragma warning(pop)
 
 #include <spdlog/spdlog.h>
@@ -55,6 +57,11 @@ int32_t AMFVideoEncoder::InitEncode(const webrtc::VideoCodec*                 co
 
     // BGRA = 4 bytes per pixel
     bgra_buf_.resize(static_cast<size_t>(w) * h * 4u);
+    waiting_for_first_keyframe_ = true;
+    encoded_frames_ = 0;
+    dropped_stale_frames_ = 0;
+    transient_no_output_frames_ = 0;
+    transient_input_full_frames_ = 0;
 
     spdlog::info("[AMFVideoEncoder] InitEncode: {}x{}", w, h);
     return WEBRTC_VIDEO_CODEC_OK;
@@ -94,42 +101,118 @@ bool AMFVideoEncoder::ensure_gpu_texture(uint32_t width, uint32_t height) {
     return true;
 }
 
-int32_t AMFVideoEncoder::Encode(const webrtc::VideoFrame&                  frame,
-                                const std::vector<webrtc::VideoFrameType>* frame_types) {
-    if (!encoder_ || !callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
-    if (!gpu_tex_)               return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+bool AMFVideoEncoder::should_drop_stale_frame(const webrtc::VideoFrame& frame) {
+    if (waiting_for_first_keyframe_) {
+        return false;
+    }
 
-    bool force_kf = force_keyframe_.exchange(false);
-    if (frame_types) {
-        for (auto type : *frame_types) {
-            if (type == webrtc::VideoFrameType::kVideoFrameKey) {
-                force_kf = true;
-                break;
-            }
+    const int64_t now_us = static_cast<int64_t>(webrtc::TimeMicros());
+    const int64_t frame_age_us = now_us - static_cast<int64_t>(frame.timestamp_us());
+    if (frame_age_us <= kMaxFrameAgeUs) {
+        return false;
+    }
+
+    ++dropped_stale_frames_;
+    log_transient_skip("stale frame", dropped_stale_frames_, frame_age_us);
+    return true;
+}
+
+bool AMFVideoEncoder::should_force_keyframe(
+    const std::vector<webrtc::VideoFrameType>* frame_types) {
+    bool force_kf = waiting_for_first_keyframe_ || force_keyframe_.exchange(false);
+    if (!frame_types) {
+        return force_kf;
+    }
+    for (const auto type : *frame_types) {
+        if (type == webrtc::VideoFrameType::kVideoFrameKey) {
+            return true;
         }
     }
+    return force_kf;
+}
 
-    auto res = encode_frame(frame, force_kf);
-    if (!res) {
-        spdlog::error("[AMFVideoEncoder] encode_frame failed: {}", res.error());
-        return WEBRTC_VIDEO_CODEC_ERROR;
+void AMFVideoEncoder::log_transient_skip(std::string_view reason,
+                                         uint64_t         skip_count,
+                                         int64_t          frame_age_us) {
+    if ((skip_count % kTransientWarnEveryN) != 0) {
+        return;
+    }
+    if (frame_age_us >= 0) {
+        spdlog::warn("[AMFVideoEncoder] Skipped {} {} entries (latest age={} ms)",
+                     skip_count, reason, frame_age_us / 1000);
+        return;
+    }
+    spdlog::warn("[AMFVideoEncoder] Skipped {} {} entries", skip_count, reason);
+}
+
+int32_t AMFVideoEncoder::handle_encode_failure(const Result<EncodedFrame>& res) {
+    std::string err = "Result<EncodedFrame> invalid state";
+    if (const std::string* e = res.error_if()) {
+        err = *e;
     }
 
-    const auto& encoded = res.value();
+    if (err.find("no output after max poll attempts") != std::string::npos) {
+        ++transient_no_output_frames_;
+        log_transient_skip("encoder-no-output", transient_no_output_frames_, -1);
+        return WEBRTC_VIDEO_CODEC_OK;
+    }
+    if (err.find("encoder input full") != std::string::npos) {
+        ++transient_input_full_frames_;
+        log_transient_skip("encoder-input-full", transient_input_full_frames_, -1);
+        return WEBRTC_VIDEO_CODEC_OK;
+    }
+
+    spdlog::error("[AMFVideoEncoder] encode_frame failed: {}", err);
+    return WEBRTC_VIDEO_CODEC_ERROR;
+}
+
+webrtc::CodecSpecificInfo AMFVideoEncoder::make_h264_codec_specific_info(bool is_keyframe) {
+    webrtc::CodecSpecificInfo codec_specific{};
+    codec_specific.codecType = webrtc::kVideoCodecH264;
+    codec_specific.codecSpecific.H264.packetization_mode =
+        webrtc::H264PacketizationMode::NonInterleaved;
+    codec_specific.codecSpecific.H264.temporal_idx = webrtc::kNoTemporalIdx;
+    codec_specific.codecSpecific.H264.idr_frame = is_keyframe;
+    codec_specific.codecSpecific.H264.base_layer_sync = false;
+    return codec_specific;
+}
+
+int32_t AMFVideoEncoder::Encode(const webrtc::VideoFrame&                  frame,
+                                const std::vector<webrtc::VideoFrameType>* frame_types) {
+    if (!encoder_ || !callback_ || !gpu_tex_) {
+        return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+    }
+    if (should_drop_stale_frame(frame)) {
+        return WEBRTC_VIDEO_CODEC_OK;
+    }
+
+    auto res = encode_frame(frame, should_force_keyframe(frame_types));
+    const EncodedFrame* encoded = res.value_if();
+    if (!encoded) {
+        return handle_encode_failure(res);
+    }
+
+    ++encoded_frames_;
+    if (waiting_for_first_keyframe_ && encoded->is_keyframe) {
+        waiting_for_first_keyframe_ = false;
+    }
 
     webrtc::EncodedImage encoded_image;
     encoded_image.SetEncodedData(
-        webrtc::EncodedImageBuffer::Create(encoded.data.data(), encoded.data.size()));
+        webrtc::EncodedImageBuffer::Create(encoded->data.data(), encoded->data.size()));
     encoded_image.SetRtpTimestamp(frame.rtp_timestamp());
     encoded_image._encodedWidth    = frame.width();
     encoded_image._encodedHeight   = frame.height();
-    encoded_image.capture_time_ms_ = frame.render_time_ms();
-    encoded_image._frameType       = encoded.is_keyframe
+    encoded_image.capture_time_ms_ = static_cast<int64_t>(frame.timestamp_us() / 1000);
+    encoded_image._frameType       = encoded->is_keyframe
                                      ? webrtc::VideoFrameType::kVideoFrameKey
                                      : webrtc::VideoFrameType::kVideoFrameDelta;
 
+    const webrtc::CodecSpecificInfo codec_specific =
+        make_h264_codec_specific_info(encoded->is_keyframe);
+
     webrtc::EncodedImageCallback::Result cb_res =
-        callback_->OnEncodedImage(encoded_image, nullptr);
+        callback_->OnEncodedImage(encoded_image, &codec_specific);
 
     if (cb_res.error != webrtc::EncodedImageCallback::Result::OK) {
         spdlog::trace("[AMFVideoEncoder] OnEncodedImage: frame dropped by WebRTC");
@@ -215,6 +298,11 @@ int32_t AMFVideoEncoder::Release() {
     callback_   = nullptr;
     tex_width_  = 0;
     tex_height_ = 0;
+    waiting_for_first_keyframe_ = true;
+    encoded_frames_ = 0;
+    dropped_stale_frames_ = 0;
+    transient_no_output_frames_ = 0;
+    transient_input_full_frames_ = 0;
     return WEBRTC_VIDEO_CODEC_OK;
 }
 

@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <dbghelp.h>
 
 #include "webrtc_host.h"
 #include "dxgi_capture.h"
@@ -25,16 +26,21 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <optional>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <thread>
 
 using namespace gamestream;
 using namespace std::chrono_literals;
+
+#pragma comment(lib, "Dbghelp.lib")
 
 // ---------------------------------------------------------------------------
 // Ctrl+C / Ctrl+Break shutdown
@@ -48,6 +54,88 @@ static BOOL WINAPI ctrl_handler(DWORD ctrl_type) noexcept {
         return TRUE;
     }
     return FALSE;
+}
+
+static LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* info) noexcept {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    char dump_name[MAX_PATH] = {};
+    std::snprintf(dump_name, sizeof(dump_name),
+                  "webrtc_test_crash_%04u%02u%02u_%02u%02u%02u.dmp",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    HANDLE dump_file = CreateFileA(dump_name, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (dump_file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei{};
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = info;
+        mei.ClientPointers = FALSE;
+
+        const BOOL ok = MiniDumpWriteDump(
+            GetCurrentProcess(),
+            GetCurrentProcessId(),
+            dump_file,
+            MiniDumpNormal,
+            info ? &mei : nullptr,
+            nullptr,
+            nullptr);
+        CloseHandle(dump_file);
+
+        if (ok) {
+            spdlog::critical("[crash] Minidump written: {}", dump_name);
+            std::fprintf(stderr, "[crash] Minidump written: %s\n", dump_name);
+        } else {
+            spdlog::critical("[crash] MiniDumpWriteDump failed: {:#010x}", GetLastError());
+            std::fprintf(stderr, "[crash] MiniDumpWriteDump failed: 0x%08X\n",
+                         static_cast<unsigned>(GetLastError()));
+        }
+    } else {
+        spdlog::critical("[crash] CreateFile({}) failed: {:#010x}", dump_name, GetLastError());
+        std::fprintf(stderr, "[crash] CreateFile(%s) failed: 0x%08X\n",
+                     dump_name, static_cast<unsigned>(GetLastError()));
+    }
+
+    if (info && info->ExceptionRecord) {
+        const auto code = static_cast<uint32_t>(info->ExceptionRecord->ExceptionCode);
+        const auto addr = info->ExceptionRecord->ExceptionAddress;
+        spdlog::critical("[crash] Unhandled exception 0x{:08X} at {}", code, addr);
+        std::fprintf(stderr, "[crash] Unhandled exception 0x%08X at %p\n",
+                     static_cast<unsigned>(code), addr);
+    } else {
+        spdlog::critical("[crash] Unhandled exception (no exception record)");
+        std::fprintf(stderr, "[crash] Unhandled exception (no exception record)\n");
+    }
+    std::fflush(stderr);
+
+    // Let process terminate after writing diagnostics.
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+[[noreturn]] static void on_terminate() {
+    try {
+        auto ep = std::current_exception();
+        if (ep) {
+            std::rethrow_exception(ep);
+        }
+        spdlog::critical("[crash] std::terminate called with no active exception");
+        std::fprintf(stderr, "[crash] std::terminate called with no active exception\n");
+    } catch (const std::exception& e) {
+        spdlog::critical("[crash] std::terminate due to std::exception: {}", e.what());
+        std::fprintf(stderr, "[crash] std::terminate due to std::exception: %s\n", e.what());
+    } catch (...) {
+        spdlog::critical("[crash] std::terminate due to non-std exception");
+        std::fprintf(stderr, "[crash] std::terminate due to non-std exception\n");
+    }
+    std::fflush(stderr);
+    std::abort();
+}
+
+static void on_signal(int sig) {
+    std::fprintf(stderr, "[crash] signal %d\n", sig);
+    std::fflush(stderr);
+    std::_Exit(128 + sig);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +402,11 @@ static void setup_logging() {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+    SetUnhandledExceptionFilter(unhandled_exception_filter);
+    std::set_terminate(on_terminate);
+    std::signal(SIGABRT, on_signal);
+    std::signal(SIGSEGV, on_signal);
+    std::signal(SIGILL, on_signal);
     setup_logging();
     spdlog::info("=== GameStream WebRTC Stage 3 ===");
 
@@ -321,13 +414,19 @@ int main(int argc, char* argv[]) {
     const auto    server_port = static_cast<INTERNET_PORT>(
                                     (argc > 2) ? std::stoul(argv[2]) : 8765u);
     const char*   session_id  = (argc > 3) ? argv[3] : "test-session";
+    const uint32_t output_index = (argc > 4) ? static_cast<uint32_t>(std::stoul(argv[4])) : 0u;
 
-    spdlog::info("[main] server={}:{}  session={}", server_host, server_port, session_id);
+    spdlog::info("[main] server={}:{}  session={}  output_index={}",
+                 server_host, server_port, session_id, output_index);
     SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
     // ---- 1. DXGI capture ----
     DXGICapture capture;
-    if (auto r = capture.initialize(0); !r) {
+    CaptureConfig cap_cfg;
+    cap_cfg.adapter_index = 0;
+    cap_cfg.find_amd_gpu = true;
+    cap_cfg.output_index = output_index;
+    if (auto r = capture.initialize_with_config(cap_cfg); !r) {
         spdlog::error("[main] DXGI capture init: {}", r.error());
         return 1;
     }
@@ -374,8 +473,8 @@ int main(int argc, char* argv[]) {
         spdlog::error("[main] create_offer: {}", r.error());
         return 1;
     }
-    spdlog::info("[main] Waiting for ICE gathering (30s timeout)...");
-    const auto offer_opt = observer.wait_for_offer(30s);
+    spdlog::info("[main] Waiting for ICE gathering (60s timeout)...");
+    const auto offer_opt = observer.wait_for_offer(60s);
     if (!offer_opt) {
         spdlog::error("[main] ICE gathering timed out");
         host.close();

@@ -3,11 +3,15 @@
 #include "iframe_capture.h"
 
 #include <media/base/adapted_video_track_source.h>
+#include <api/video/color_space.h>
+#include <api/video/i420_buffer.h>
+#include <api/video/video_frame_buffer.h>
 
 #include <d3d11.h>
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -33,6 +37,23 @@ public:
 
 private:
     void capture_loop();
+    void emit_frame(const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer,
+                    uint32_t rtp_timestamp,
+                    const webrtc::ColorSpace& color_space);
+    bool handle_acquire_failure(const Result<CaptureFrame>& frame_res,
+                                const webrtc::scoped_refptr<webrtc::I420Buffer>& last_i420,
+                                uint32_t rtp_timestamp,
+                                const webrtc::ColorSpace& color_space,
+                                bool& invalid_result_logged,
+                                bool& emitted_fallback);
+    void process_acquired_frame(const Result<CaptureFrame>& frame_res,
+                                webrtc::scoped_refptr<webrtc::I420Buffer>& last_i420,
+                                uint32_t& rtp_timestamp,
+                                std::chrono::steady_clock::time_point& next_emit_deadline,
+                                const webrtc::ColorSpace& color_space,
+                                bool& invalid_result_logged);
+    bool convert_frame_to_i420(const CaptureFrame& frame,
+                               webrtc::scoped_refptr<webrtc::I420Buffer>& i420_buffer);
     bool ensure_staging_texture(uint32_t width, uint32_t height);
 
     IFrameCapture* capture_;  // not owned

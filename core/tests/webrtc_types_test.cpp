@@ -226,6 +226,16 @@ TEST(WebRTCConfigTest, DefaultIceServersListIsEmpty) {
     EXPECT_TRUE(cfg.ice_servers.empty());
 }
 
+TEST(WebRTCConfigTest, DefaultIceBackupCandidatePairPingIntervalIs1000ms) {
+    WebRTCConfig cfg;
+    EXPECT_EQ(cfg.ice_backup_candidate_pair_ping_interval_ms, 1000);
+}
+
+TEST(WebRTCConfigTest, DefaultIceConnectionReceivingTimeoutIs10000ms) {
+    WebRTCConfig cfg;
+    EXPECT_EQ(cfg.ice_connection_receiving_timeout_ms, 10000);
+}
+
 TEST(WebRTCConfigTest, AddingIceServersWorks) {
     WebRTCConfig cfg;
     IceServer stun;
@@ -234,6 +244,15 @@ TEST(WebRTCConfigTest, AddingIceServersWorks) {
 
     ASSERT_EQ(cfg.ice_servers.size(), 1u);
     EXPECT_EQ(cfg.ice_servers[0].uri, "stun:stun.l.google.com:19302");
+}
+
+TEST(WebRTCConfigTest, IceTimeoutSettingsAreWritable) {
+    WebRTCConfig cfg;
+    cfg.ice_backup_candidate_pair_ping_interval_ms = 1500;
+    cfg.ice_connection_receiving_timeout_ms = 12000;
+
+    EXPECT_EQ(cfg.ice_backup_candidate_pair_ping_interval_ms, 1500);
+    EXPECT_EQ(cfg.ice_connection_receiving_timeout_ms, 12000);
 }
 
 // ===========================================================================

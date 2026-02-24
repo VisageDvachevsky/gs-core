@@ -2,11 +2,41 @@
 
 #include <libyuv.h>
 #include <api/video/i420_buffer.h>
+#include <api/video/color_space.h>
 #include <api/video/video_frame.h>
 #include <rtc_base/time_utils.h>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
+
 namespace gamestream {
+
+namespace {
+
+constexpr int kTargetFps = 60;
+constexpr uint32_t kRtpTicksPerFrame = 90000u / kTargetFps;
+const auto kFrameInterval = std::chrono::microseconds(1'000'000 / kTargetFps);
+
+void advance_pacer(uint32_t& rtp_timestamp,
+                   std::chrono::steady_clock::time_point& next_emit_deadline) {
+    rtp_timestamp += kRtpTicksPerFrame;
+    next_emit_deadline += kFrameInterval;
+    const auto now = std::chrono::steady_clock::now();
+    if (next_emit_deadline < now) {
+        next_emit_deadline = now;
+    }
+}
+
+webrtc::ColorSpace make_desktop_color_space() {
+    // ARGBToI420 uses BT.601 limited-range coefficients.
+    return webrtc::ColorSpace(
+        webrtc::ColorSpace::PrimaryID::kSMPTE170M,
+        webrtc::ColorSpace::TransferID::kSMPTE170M,
+        webrtc::ColorSpace::MatrixID::kSMPTE170M,
+        webrtc::ColorSpace::RangeID::kLimited);
+}
+
+}  // namespace
 
 CaptureVideoSource::CaptureVideoSource(IFrameCapture* capture)
     : capture_(capture)
@@ -70,62 +100,139 @@ bool CaptureVideoSource::ensure_staging_texture(uint32_t width, uint32_t height)
     return true;
 }
 
+void CaptureVideoSource::emit_frame(
+    const webrtc::scoped_refptr<webrtc::VideoFrameBuffer>& buffer,
+    uint32_t                                               rtp_timestamp,
+    const webrtc::ColorSpace&                              color_space) {
+    webrtc::VideoFrame video_frame = webrtc::VideoFrame::Builder()
+        .set_video_frame_buffer(buffer)
+        .set_timestamp_rtp(rtp_timestamp)
+        .set_timestamp_us(webrtc::TimeMicros())
+        .set_color_space(color_space)
+        .set_rotation(webrtc::kVideoRotation_0)
+        .build();
+    OnFrame(video_frame);
+}
+
+bool CaptureVideoSource::handle_acquire_failure(
+    const Result<CaptureFrame>&                       frame_res,
+    const webrtc::scoped_refptr<webrtc::I420Buffer>& last_i420,
+    uint32_t                                          rtp_timestamp,
+    const webrtc::ColorSpace&                         color_space,
+    bool&                                             invalid_result_logged,
+    bool&                                             emitted_fallback) {
+    emitted_fallback = false;
+    if (frame_res) {
+        return false;
+    }
+
+    std::string err = "Result<CaptureFrame> invalid state";
+    if (const std::string* e = frame_res.error_if()) {
+        err = *e;
+    }
+    if (err == "timeout") {
+        if (last_i420) {
+            emit_frame(last_i420, rtp_timestamp, color_space);
+            emitted_fallback = true;
+        }
+        return true;
+    }
+
+    if (!invalid_result_logged) {
+        spdlog::error("[CaptureVideoSource] acquire_frame() returned invalid result state: {}", err);
+        invalid_result_logged = true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return true;
+}
+
+bool CaptureVideoSource::convert_frame_to_i420(
+    const CaptureFrame&                       frame,
+    webrtc::scoped_refptr<webrtc::I420Buffer>& i420_buffer) {
+    if (!frame.texture) {
+        return false;
+    }
+    if (!d3d_device_) {
+        frame.texture->GetDevice(&d3d_device_);
+        d3d_device_->GetImmediateContext(&d3d_context_);
+    }
+    if (!ensure_staging_texture(frame.width, frame.height)) {
+        return false;
+    }
+
+    d3d_context_->CopyResource(staging_tex_.Get(), frame.texture.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(d3d_context_->Map(staging_tex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+
+    i420_buffer = webrtc::I420Buffer::Create(frame.width, frame.height);
+    libyuv::ARGBToI420(
+        static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
+        i420_buffer->MutableDataY(), i420_buffer->StrideY(),
+        i420_buffer->MutableDataU(), i420_buffer->StrideU(),
+        i420_buffer->MutableDataV(), i420_buffer->StrideV(),
+        frame.width, frame.height);
+    d3d_context_->Unmap(staging_tex_.Get(), 0);
+    return true;
+}
+
+void CaptureVideoSource::process_acquired_frame(
+    const Result<CaptureFrame>&               frame_res,
+    webrtc::scoped_refptr<webrtc::I420Buffer>& last_i420,
+    uint32_t&                                  rtp_timestamp,
+    std::chrono::steady_clock::time_point&     next_emit_deadline,
+    const webrtc::ColorSpace&                  color_space,
+    bool&                                      invalid_result_logged) {
+    const CaptureFrame* frame_ptr = frame_res.value_if();
+    if (!frame_ptr) {
+        if (!invalid_result_logged) {
+            spdlog::error("[CaptureVideoSource] acquire_frame() success state has no value");
+            invalid_result_logged = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return;
+    }
+
+    webrtc::scoped_refptr<webrtc::I420Buffer> i420_buffer;
+    if (convert_frame_to_i420(*frame_ptr, i420_buffer)) {
+        last_i420 = i420_buffer;
+        emit_frame(i420_buffer, rtp_timestamp, color_space);
+        advance_pacer(rtp_timestamp, next_emit_deadline);
+    }
+    capture_->release_frame();
+}
+
 void CaptureVideoSource::capture_loop() {
     spdlog::info("[CaptureVideoSource] Capture thread started");
-    
+
+    webrtc::scoped_refptr<webrtc::I420Buffer> last_i420;
+    auto next_emit_deadline = std::chrono::steady_clock::now();
+    uint32_t rtp_timestamp =
+        static_cast<uint32_t>((webrtc::TimeMicros() * 90) / 1000);
+    const webrtc::ColorSpace desktop_color_space = make_desktop_color_space();
+
+    bool invalid_result_logged = false;
     while (running_) {
-        // Assume 60fps pacing done by capture_ -> it wait for vblank or similar.
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_emit_deadline) {
+            std::this_thread::sleep_for(next_emit_deadline - now);
+        }
+
         auto frame_res = capture_->acquire_frame(16);
-        if (!frame_res) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bool emitted_fallback = false;
+        if (handle_acquire_failure(frame_res, last_i420, rtp_timestamp, desktop_color_space,
+                                   invalid_result_logged, emitted_fallback)) {
+            if (emitted_fallback) {
+                advance_pacer(rtp_timestamp, next_emit_deadline);
+            }
             continue;
         }
-
-        const auto& frame = frame_res.value();
-        if (!frame.texture) continue;
-
-        if (!d3d_device_) {
-            frame.texture->GetDevice(&d3d_device_);
-            d3d_device_->GetImmediateContext(&d3d_context_);
-        }
-
-        if (!ensure_staging_texture(frame.width, frame.height)) {
-            continue;
-        }
-
-        // Copy frame to STAGING texture
-        d3d_context_->CopyResource(staging_tex_.Get(), frame.texture.Get());
-
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(d3d_context_->Map(staging_tex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-            
-            // Convert to I420
-            webrtc::scoped_refptr<webrtc::I420Buffer> i420_buffer = 
-                webrtc::I420Buffer::Create(frame.width, frame.height);
-                
-            libyuv::ARGBToI420(
-                static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
-                i420_buffer->MutableDataY(), i420_buffer->StrideY(),
-                i420_buffer->MutableDataU(), i420_buffer->StrideU(),
-                i420_buffer->MutableDataV(), i420_buffer->StrideV(),
-                frame.width, frame.height
-            );
-
-            d3d_context_->Unmap(staging_tex_.Get(), 0);
-
-            webrtc::VideoFrame video_frame = webrtc::VideoFrame::Builder()
-                .set_video_frame_buffer(i420_buffer)
-                .set_timestamp_rtp(static_cast<uint32_t>(webrtc::TimeMillis() * 90))
-                .set_timestamp_us(webrtc::TimeMicros())
-                .set_rotation(webrtc::kVideoRotation_0)
-                .build();
-
-            // Broadcaster / OnFrame from AdaptedVideoTrackSource
-            OnFrame(video_frame);
-        }
-        capture_->release_frame();
+        process_acquired_frame(frame_res, last_i420, rtp_timestamp, next_emit_deadline,
+                               desktop_color_space, invalid_result_logged);
     }
-    
+
     spdlog::info("[CaptureVideoSource] Capture thread stopped");
 }
 

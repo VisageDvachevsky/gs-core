@@ -168,6 +168,8 @@ struct IceServer {
 struct WebRTCConfig {
     std::vector<IceServer> ice_servers;
     std::string input_channel_label = "input";
+    int         ice_backup_candidate_pair_ping_interval_ms = 1000;
+    int         ice_connection_receiving_timeout_ms = 10000;
 };
 
 } // namespace gamestream

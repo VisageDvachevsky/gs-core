@@ -83,6 +83,16 @@
       log(msg, cls);
     }
 
+    async function ensureVideoPlayback() {
+      const video = document.getElementById('video');
+      video.muted = true; // make autoplay robust across browsers
+      try {
+        await video.play();
+      } catch (e) {
+        log('video.play() blocked: ' + e.message, 'log-warn');
+      }
+    }
+
     // ------------------------------------------------------------------
     // Connect
     // ------------------------------------------------------------------
@@ -125,7 +135,10 @@
         pc.ontrack = (event) => {
           log(`Track received: kind=${event.track.kind}`, 'log-ok');
           if (event.track.kind === 'video') {
-            document.getElementById('video').srcObject = event.streams[0];
+            const video = document.getElementById('video');
+            video.srcObject = event.streams[0];
+            video.onloadedmetadata = () => void ensureVideoPlayback();
+            void ensureVideoPlayback();
           }
         };
 

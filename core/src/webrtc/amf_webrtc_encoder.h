@@ -21,6 +21,7 @@
 #include <api/environment/environment.h>
 #include <api/video/video_frame.h>
 #include <api/video/i420_buffer.h>
+#include <modules/video_coding/include/video_codec_interface.h>
 #include <third_party/libyuv/include/libyuv.h>
 #pragma warning(pop)
 
@@ -29,6 +30,7 @@
 
 #include <atomic>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace gamestream {
@@ -84,12 +86,20 @@ public:
     webrtc::VideoEncoder::EncoderInfo GetEncoderInfo() const override;
 
 private:
+    static constexpr int64_t kMaxFrameAgeUs = 120'000;
+    static constexpr uint64_t kTransientWarnEveryN = 120;
+
     /// Convert I420 → BGRA, upload to GPU texture, call IEncoder::encode().
     [[nodiscard]] Result<EncodedFrame> encode_frame(const webrtc::VideoFrame& frame,
                                                     bool                      force_keyframe);
 
     /// Create or resize the BGRA GPU texture.  Returns false and logs on failure.
     bool ensure_gpu_texture(uint32_t width, uint32_t height);
+    bool should_drop_stale_frame(const webrtc::VideoFrame& frame);
+    bool should_force_keyframe(const std::vector<webrtc::VideoFrameType>* frame_types);
+    int32_t handle_encode_failure(const Result<EncodedFrame>& res);
+    static webrtc::CodecSpecificInfo make_h264_codec_specific_info(bool is_keyframe);
+    void log_transient_skip(std::string_view reason, uint64_t skip_count, int64_t frame_age_us);
 
     IEncoder*                     encoder_;     // not owned
     ID3D11Device*                 d3d_device_;  // not owned
@@ -101,6 +111,11 @@ private:
 
     webrtc::EncodedImageCallback* callback_       = nullptr;
     std::atomic<bool>             force_keyframe_{false};
+    bool                          waiting_for_first_keyframe_ = true;
+    uint64_t                      encoded_frames_ = 0;
+    uint64_t                      dropped_stale_frames_ = 0;
+    uint64_t                      transient_no_output_frames_ = 0;
+    uint64_t                      transient_input_full_frames_ = 0;
 };
 
 /// WebRTC VideoEncoderFactory that produces AMFVideoEncoder instances.
