@@ -147,11 +147,47 @@ private:
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Forward declaration — DataChannelObserverBridge references WebRTCHostImpl
+// ---------------------------------------------------------------------------
+
+class WebRTCHostImpl;
+
+// ---------------------------------------------------------------------------
+// DataChannelObserverBridge
+//
+// Routes DataChannel state/message callbacks to WebRTCHostImpl, identifying
+// which of the two input channels (fast / reliable) generated the event.
+// ---------------------------------------------------------------------------
+
+class DataChannelObserverBridge final : public webrtc::DataChannelObserver {
+public:
+    enum class ChannelKind { kFast, kReliable };
+
+    DataChannelObserverBridge(WebRTCHostImpl* host, ChannelKind kind,
+                               webrtc::DataChannelInterface* channel)
+        : host_(host), kind_(kind), channel_(channel) {}
+
+    // Non-copyable, non-movable: registered as a raw observer pointer;
+    // the DataChannel retains the address, so moving would invalidate it.
+    DataChannelObserverBridge(const DataChannelObserverBridge&)            = delete;
+    DataChannelObserverBridge& operator=(const DataChannelObserverBridge&) = delete;
+    DataChannelObserverBridge(DataChannelObserverBridge&&)                 = delete;
+    DataChannelObserverBridge& operator=(DataChannelObserverBridge&&)      = delete;
+
+    void OnStateChange() override;
+    void OnMessage(const webrtc::DataBuffer& buffer) override;
+
+private:
+    WebRTCHostImpl*                  host_;    // Non-owning
+    ChannelKind                      kind_;
+    webrtc::DataChannelInterface*    channel_; // Non-owning; used for state query only
+};
+
+// ---------------------------------------------------------------------------
 // WebRTCHostImpl
 // ---------------------------------------------------------------------------
 
-class WebRTCHostImpl : public webrtc::PeerConnectionObserver,
-                       public webrtc::DataChannelObserver {
+class WebRTCHostImpl : public webrtc::PeerConnectionObserver {
 public:
     WebRTCHostImpl();
     ~WebRTCHostImpl() override;
@@ -168,6 +204,11 @@ public:
     PeerConnectionState get_connection_state() const { return state_.load(); }
     bool is_initialized() const { return initialized_.load(); }
 
+    // Called by DataChannelObserverBridge callbacks.
+    void on_channel_state_change(DataChannelObserverBridge::ChannelKind kind,
+                                 webrtc::DataChannelInterface::DataState  state);
+    void on_channel_message(const webrtc::DataBuffer& buffer);
+
     // webrtc::PeerConnectionObserver
     void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState) override {}
     void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) override;
@@ -183,10 +224,6 @@ public:
     void OnRemoveTrack(webrtc::scoped_refptr<webrtc::RtpReceiverInterface>) override {}
     void OnRenegotiationNeeded() override {}
 
-    // webrtc::DataChannelObserver
-    void OnStateChange() override;
-    void OnMessage(const webrtc::DataBuffer& buffer) override;
-
 private:
     [[nodiscard]] VoidResult fail_initialize(std::string msg);
     [[nodiscard]] VoidResult initialize_network_stack();
@@ -197,12 +234,13 @@ private:
         webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config);
     [[nodiscard]] VoidResult create_peer_connection(
         const webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config);
-    void create_input_data_channel();
+    [[nodiscard]] VoidResult create_input_data_channels();
     void enable_d3d11_multithread(ID3D11Device* device) const;
     void inject_encoder_factory(IEncoder* encoder, ID3D11Device* device);
     [[nodiscard]] VoidResult add_video_transceiver(
         const webrtc::scoped_refptr<webrtc::VideoTrackInterface>& video_track);
     void cap_sender_framerate(const webrtc::scoped_refptr<webrtc::RtpSenderInterface>& sender) const;
+    void close_data_channels();
 
     std::unique_ptr<webrtc::Thread> network_thread_;
     std::unique_ptr<webrtc::Thread> worker_thread_;
@@ -210,12 +248,18 @@ private:
 
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface>        pc_;
-    webrtc::scoped_refptr<webrtc::DataChannelInterface>           data_channel_;
-    webrtc::scoped_refptr<CaptureVideoSource>                     video_source_;
+
+    // Dual-channel input protocol (Stage 4):
+    //   fast     — MOUSEEVENTF_MOVE at 120 Hz; unreliable, unordered.
+    //   reliable — buttons, keys, wheel; ordered, reliable.
+    webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel_fast_;
+    webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel_reliable_;
+    std::unique_ptr<DataChannelObserverBridge>           channel_observer_fast_;
+    std::unique_ptr<DataChannelObserverBridge>           channel_observer_reliable_;
+
+    webrtc::scoped_refptr<CaptureVideoSource> video_source_;
 
     // Non-owning pointer to the factory (owned by factory_ via CreatePeerConnectionFactory).
-    // Retained so set_encoder() can be called in add_video_track() before WebRTC's
-    // first Create() during SDP negotiation.
     AMFVideoEncoderFactory* amf_encoder_factory_ = nullptr;
 
     WebRTCConfig                     config_;
@@ -227,6 +271,20 @@ private:
     bool                             ssl_initialized_ = false;
     bool                             winsock_initialized_ = false;
 };
+
+// ---------------------------------------------------------------------------
+// DataChannelObserverBridge — implementations
+// ---------------------------------------------------------------------------
+
+void DataChannelObserverBridge::OnStateChange() {
+    if (channel_) {
+        host_->on_channel_state_change(kind_, channel_->state());
+    }
+}
+
+void DataChannelObserverBridge::OnMessage(const webrtc::DataBuffer& buffer) {
+    host_->on_channel_message(buffer);
+}
 
 // ---------------------------------------------------------------------------
 // WebRTCHostImpl — implementations
@@ -277,8 +335,9 @@ VoidResult WebRTCHostImpl::create_worker_threads() {
 
 VoidResult WebRTCHostImpl::create_factory() {
     // Create encoder factory with deferred injection.
-    // Save raw pointer BEFORE std::move — factory_ takes ownership, but we
-    // keep amf_encoder_factory_ as a non-owning observation point.
+    // Save raw pointer BEFORE std::move — factory_ takes ownership via
+    // CreatePeerConnectionFactory, but we keep amf_encoder_factory_ as a
+    // non-owning observation point so set_encoder() can be called later.
     auto factory_owned = std::make_unique<AMFVideoEncoderFactory>();
     amf_encoder_factory_ = factory_owned.get();
 
@@ -290,7 +349,7 @@ VoidResult WebRTCHostImpl::create_factory() {
         webrtc::CreateBuiltinAudioEncoderFactory(),
         webrtc::CreateBuiltinAudioDecoderFactory(),
         std::move(factory_owned),
-        /*video_decoder_factory=*/nullptr,   // sender-only host; no inbound video to decode
+        /*video_decoder_factory=*/nullptr,
         /*audio_mixer=*/nullptr,
         /*audio_processing=*/nullptr);
 
@@ -302,11 +361,12 @@ VoidResult WebRTCHostImpl::build_rtc_config(
     const WebRTCConfig& config,
     webrtc::PeerConnectionInterface::RTCConfiguration& rtc_config) {
     rtc_config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
-    // Disable TCP (UDP-only) for lower latency.
+    // Disable TCP candidates for lower latency (UDP-only).
     // Do NOT disable adapter enumeration: on machines with virtual adapters
-    // (Hyper-V, VPN — 198.18.0.x) disabling enumeration causes WebRTC to pick
-    // a virtual interface as the sole host candidate, which is unreachable from
-    // the browser.  Full enumeration lets ICE prefer the real LAN IP.
+    // (Hyper-V, VPN — 198.18.0.x) disabling enumeration causes WebRTC to
+    // pick a virtual interface as the sole host candidate, which is
+    // unreachable from the browser.  Full enumeration lets ICE prefer the
+    // real LAN IP.
     rtc_config.set_port_allocator_flags(webrtc::PORTALLOCATOR_DISABLE_TCP);
     if (config.ice_backup_candidate_pair_ping_interval_ms <= 0) {
         return fail_initialize("ice_backup_candidate_pair_ping_interval_ms must be > 0");
@@ -314,12 +374,21 @@ VoidResult WebRTCHostImpl::build_rtc_config(
     if (config.ice_connection_receiving_timeout_ms <= 0) {
         return fail_initialize("ice_connection_receiving_timeout_ms must be > 0");
     }
-    // Reduce chances of hard fail when the initially-selected pair is a
-    // virtual adapter path. Values are runtime-configurable in WebRTCConfig.
+    // Values are runtime-configurable in WebRTCConfig to reduce hard failures
+    // when the initially-selected ICE pair routes through a virtual adapter.
     rtc_config.ice_backup_candidate_pair_ping_interval =
         config.ice_backup_candidate_pair_ping_interval_ms;
     rtc_config.ice_connection_receiving_timeout =
         config.ice_connection_receiving_timeout_ms;
+
+    // Restrict ICE to a fixed UDP port range when configured.
+    // RTCConfiguration propagates min/max to the internal PortAllocator.
+    if (config.min_ice_port > 0 && config.max_ice_port >= config.min_ice_port) {
+        rtc_config.set_min_port(config.min_ice_port);
+        rtc_config.set_max_port(config.max_ice_port);
+        spdlog::info("[WebRTCHost] ICE port range: {}-{}",
+                     config.min_ice_port, config.max_ice_port);
+    }
 
     // Populate ICE servers from config.  Empty list = host candidates only
     // (LAN/localhost).  For internet streaming, callers must supply STUN/TURN.
@@ -344,26 +413,56 @@ VoidResult WebRTCHostImpl::create_peer_connection(
     return VoidResult();
 }
 
-void WebRTCHostImpl::create_input_data_channel() {
-    // Create input DataChannel now (we are the offerer).
-    // Stage 4 will switch to ordered=false, maxRetransmits=0 for input events.
-    webrtc::DataChannelInit dc_init;
-    dc_init.ordered = true;
+VoidResult WebRTCHostImpl::create_input_data_channels() {
+    // Channel 1: high-rate relative mouse movement — unreliable, unordered.
+    // Packet loss is acceptable; stale movement deltas are useless anyway.
+    webrtc::DataChannelInit fast_init;
+    fast_init.ordered       = false;
+    fast_init.maxRetransmits = 0;
 
-    auto dc_res = pc_->CreateDataChannelOrError(config_.input_channel_label, &dc_init);
-    if (dc_res.ok()) {
-        data_channel_ = dc_res.MoveValue();
-        data_channel_->RegisterObserver(this);
+    auto fast_res = pc_->CreateDataChannelOrError(config_.fast_input_channel_label, &fast_init);
+    if (fast_res.ok()) {
+        data_channel_fast_ = fast_res.MoveValue();
+        channel_observer_fast_ = std::make_unique<DataChannelObserverBridge>(
+            this,
+            DataChannelObserverBridge::ChannelKind::kFast,
+            data_channel_fast_.get());
+        data_channel_fast_->RegisterObserver(channel_observer_fast_.get());
+        spdlog::debug("[WebRTCHost] DataChannel '{}' created (unreliable)",
+                      config_.fast_input_channel_label);
     } else {
-        spdlog::error("[WebRTCHost] CreateDataChannel failed");
+        spdlog::error("[WebRTCHost] CreateDataChannel '{}' failed",
+                      config_.fast_input_channel_label);
+        return fail_initialize("CreateDataChannel failed: " + config_.fast_input_channel_label);
     }
+
+    // Channel 2: discrete events — buttons, keyboard, wheel, RELEASE_ALL.
+    // Ordered and reliable; loss of a KEY_UP would cause stuck keys.
+    webrtc::DataChannelInit reliable_init;
+    reliable_init.ordered = true;  // reliable by default (no maxRetransmits/maxPacketLifeTime)
+
+    auto rel_res = pc_->CreateDataChannelOrError(config_.reliable_input_channel_label,
+                                                  &reliable_init);
+    if (rel_res.ok()) {
+        data_channel_reliable_ = rel_res.MoveValue();
+        channel_observer_reliable_ = std::make_unique<DataChannelObserverBridge>(
+            this,
+            DataChannelObserverBridge::ChannelKind::kReliable,
+            data_channel_reliable_.get());
+        data_channel_reliable_->RegisterObserver(channel_observer_reliable_.get());
+        spdlog::debug("[WebRTCHost] DataChannel '{}' created (reliable)",
+                      config_.reliable_input_channel_label);
+    } else {
+        spdlog::error("[WebRTCHost] CreateDataChannel '{}' failed",
+                      config_.reliable_input_channel_label);
+        return fail_initialize("CreateDataChannel failed: " + config_.reliable_input_channel_label);
+    }
+
+    return VoidResult();
 }
 
 void WebRTCHostImpl::enable_d3d11_multithread(ID3D11Device* device) const {
-    if (!device) {
-        return;
-    }
-    // Capture thread + encode thread share the immediate context: enable D3D11 MT protection.
+    if (!device) return;
     Microsoft::WRL::ComPtr<ID3D11Multithread> mt;
     if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11Multithread),
                                          reinterpret_cast<void**>(mt.GetAddressOf())))) {
@@ -382,8 +481,8 @@ void WebRTCHostImpl::inject_encoder_factory(IEncoder* encoder, ID3D11Device* dev
 
 VoidResult WebRTCHostImpl::add_video_transceiver(
     const webrtc::scoped_refptr<webrtc::VideoTrackInterface>& video_track) {
-    // Use AddTransceiver with kSendOnly to avoid kSendRecv intersection
-    // issues when no decoder factory is provided (sender-only host).
+    // Use kSendOnly to avoid kSendRecv intersection issues when no decoder
+    // factory is provided (this host is sender-only; it never decodes video).
     webrtc::RtpTransceiverInit trans_init;
     trans_init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
     trans_init.stream_ids = {"gamestream_stream"};
@@ -451,7 +550,7 @@ VoidResult WebRTCHostImpl::initialize(const WebRTCConfig& config,
     webrtc::PeerConnectionInterface::RTCConfiguration rtc_config;
     if (auto r = build_rtc_config(config, rtc_config); !r) return r;
     if (auto r = create_peer_connection(rtc_config); !r) return r;
-    create_input_data_channel();
+    if (auto r = create_input_data_channels(); !r) return r;
 
     initialized_ = true;
     spdlog::info("[WebRTCHost] Initialized successfully");
@@ -460,14 +559,6 @@ VoidResult WebRTCHostImpl::initialize(const WebRTCConfig& config,
 
 VoidResult WebRTCHostImpl::create_offer() {
     if (!pc_) return VoidResult::error("Not initialized");
-    // Use default options (offer_to_receive_video = kUndefined = -1).
-    // Setting offer_to_receive_video = 1 in Unified Plan changes the
-    // transceiver direction from kSendOnly to kSendRecv, which causes
-    // GetVideoCodecsForOffer() to return the intersection of send+recv codecs.
-    // Since video_decoder_factory=nullptr, recv codecs are empty → intersection
-    // is empty → video m-section gets rejected (port 0) in the SDP.
-    // With kUndefined the existing kSendOnly transceiver is used as-is, and
-    // GetVideoCodecsForOffer(kSendOnly) returns video_send_codecs (H264).
     webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
     pc_->CreateOffer(CreateOfferObserver::Create(pc_.get()).get(), options);
     return VoidResult();
@@ -517,7 +608,7 @@ VoidResult WebRTCHostImpl::add_ice_candidate(IceCandidateInfo candidate) {
     }
 
     if (!pc_->AddIceCandidate(ice_candidate.get())) {
-        spdlog::error("[WebRTCHost] AddIceCandidate rejected — candidate may be invalid or ICE agent not ready");
+        spdlog::error("[WebRTCHost] AddIceCandidate rejected");
         return VoidResult::error("AddIceCandidate failed");
     }
     return VoidResult();
@@ -550,12 +641,13 @@ VoidResult WebRTCHostImpl::add_video_track(IFrameCapture* capture, IEncoder* enc
 }
 
 void WebRTCHostImpl::send_data(const uint8_t* data, size_t size) {
-    if (!data_channel_ ||
-        data_channel_->state() != webrtc::DataChannelInterface::kOpen) {
+    // Host→client data goes on the reliable channel (e.g., latency ack).
+    if (!data_channel_reliable_ ||
+        data_channel_reliable_->state() != webrtc::DataChannelInterface::kOpen) {
         return;
     }
     webrtc::CopyOnWriteBuffer buf(data, size);
-    data_channel_->Send(webrtc::DataBuffer(buf, /*binary=*/true));
+    data_channel_reliable_->Send(webrtc::DataBuffer(buf, /*binary=*/true));
 }
 
 void WebRTCHostImpl::request_keyframe() {
@@ -565,6 +657,22 @@ void WebRTCHostImpl::request_keyframe() {
     }
 }
 
+void WebRTCHostImpl::close_data_channels() {
+    if (data_channel_fast_) {
+        data_channel_fast_->UnregisterObserver();
+        data_channel_fast_->Close();
+        data_channel_fast_ = nullptr;
+    }
+    channel_observer_fast_.reset();
+
+    if (data_channel_reliable_) {
+        data_channel_reliable_->UnregisterObserver();
+        data_channel_reliable_->Close();
+        data_channel_reliable_ = nullptr;
+    }
+    channel_observer_reliable_.reset();
+}
+
 void WebRTCHostImpl::close() {
     initialized_ = false;
 
@@ -572,11 +680,9 @@ void WebRTCHostImpl::close() {
         video_source_->stop();
         video_source_ = nullptr;
     }
-    if (data_channel_) {
-        data_channel_->UnregisterObserver();
-        data_channel_->Close();
-        data_channel_ = nullptr;
-    }
+
+    close_data_channels();
+
     if (pc_) {
         pc_->Close();
         pc_ = nullptr;
@@ -607,15 +713,52 @@ void WebRTCHostImpl::close() {
 }
 
 // ---------------------------------------------------------------------------
+// DataChannel bridge callbacks — called from DataChannelObserverBridge
+// ---------------------------------------------------------------------------
+
+void WebRTCHostImpl::on_channel_state_change(
+    DataChannelObserverBridge::ChannelKind kind,
+    webrtc::DataChannelInterface::DataState state) {
+
+    if (kind == DataChannelObserverBridge::ChannelKind::kReliable) {
+        // Reliable channel is the primary signalling point for open/close.
+        if (state == webrtc::DataChannelInterface::kOpen) {
+            spdlog::info("[WebRTCHost] Input DataChannels open (fast={}, reliable={})",
+                         data_channel_fast_ ?
+                             webrtc::DataChannelInterface::DataStateString(data_channel_fast_->state()) :
+                             "n/a",
+                         "open");
+            if (observer_) observer_->on_data_channel_open();
+        } else if (state == webrtc::DataChannelInterface::kClosed) {
+            spdlog::info("[WebRTCHost] Reliable input channel closed");
+            if (observer_) observer_->on_data_channel_closed();
+        }
+    } else {
+        // Log fast channel state changes at debug level only.
+        spdlog::debug("[WebRTCHost] Fast input channel state: {}",
+                      webrtc::DataChannelInterface::DataStateString(state));
+        if (state == webrtc::DataChannelInterface::kClosed) {
+            spdlog::warn("[WebRTCHost] Fast input channel closed unexpectedly");
+        }
+    }
+}
+
+void WebRTCHostImpl::on_channel_message(const webrtc::DataBuffer& buffer) {
+    if (observer_) {
+        observer_->on_data_channel_message(buffer.data.data(), buffer.data.size());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PeerConnectionObserver callbacks
 // ---------------------------------------------------------------------------
 
 void WebRTCHostImpl::OnDataChannel(
     webrtc::scoped_refptr<webrtc::DataChannelInterface> dc) {
-    if (!data_channel_) {
-        data_channel_ = dc;
-        data_channel_->RegisterObserver(this);
-    }
+    // Host creates both channels — this fires only if the remote peer
+    // creates a channel we didn't initiate (not expected in this architecture).
+    spdlog::warn("[WebRTCHost] Remote peer opened unexpected DataChannel: {}",
+                 dc ? dc->label() : "(null)");
 }
 
 void WebRTCHostImpl::OnIceConnectionChange(
@@ -643,7 +786,7 @@ void WebRTCHostImpl::OnIceCandidate(const webrtc::IceCandidate* candidate) {
 
 void WebRTCHostImpl::OnIceSelectedCandidatePairChanged(
     const webrtc::CandidatePairChangeEvent& event) {
-    const auto& local = event.selected_candidate_pair.local_candidate();
+    const auto& local  = event.selected_candidate_pair.local_candidate();
     const auto& remote = event.selected_candidate_pair.remote_candidate();
     spdlog::debug("[WebRTCHost] Selected ICE pair: local={}({}/{})  remote={}({}/{})  reason={}",
                   local.address().ToString(), local.type_name(), local.protocol(),
@@ -656,9 +799,6 @@ void WebRTCHostImpl::OnIceGatheringChange(
     if (state != webrtc::PeerConnectionInterface::kIceGatheringComplete) return;
     if (!observer_ || !pc_) return;
 
-    // All ICE candidates are now embedded in the local description SDP.
-    // Notify observer with the complete SDP — no ICE trickling needed for LAN/loopback.
-    // Trickle ICE is Stage 5.
     const webrtc::SessionDescriptionInterface* local_desc = pc_->local_description();
     if (!local_desc) {
         spdlog::warn("[WebRTCHost] ICE gathering complete but local description is null");
@@ -684,25 +824,6 @@ void WebRTCHostImpl::OnIceGatheringChange(
     spdlog::info("[WebRTCHost] ICE gathering complete — SDP ready ({} bytes)", sdp.size());
     observer_->on_local_sdp_created(s);
     observer_->on_ice_gathering_complete();
-}
-
-// ---------------------------------------------------------------------------
-// DataChannelObserver callbacks
-// ---------------------------------------------------------------------------
-
-void WebRTCHostImpl::OnStateChange() {
-    if (!data_channel_) return;
-    if (data_channel_->state() == webrtc::DataChannelInterface::kOpen) {
-        if (observer_) observer_->on_data_channel_open();
-    } else if (data_channel_->state() == webrtc::DataChannelInterface::kClosed) {
-        if (observer_) observer_->on_data_channel_closed();
-    }
-}
-
-void WebRTCHostImpl::OnMessage(const webrtc::DataBuffer& buffer) {
-    if (observer_) {
-        observer_->on_data_channel_message(buffer.data.data(), buffer.data.size());
-    }
 }
 
 // ---------------------------------------------------------------------------

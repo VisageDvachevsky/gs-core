@@ -44,10 +44,14 @@ public:
 
     /// Called when binary data arrives on the DataChannel.
     ///
-    /// Packet layout (binary input protocol):
-    ///   [0]     uint8_t  — type (0x01 mouse_move, 0x02 click, 0x04 key, 0x05 pad)
-    ///   [1..8]  uint64_t — timestamp (little-endian, microseconds)
-    ///   [9..]   payload  — type-specific fields
+    /// Packet layout (binary input protocol v1, little-endian):
+    ///   [0]      uint8_t  version
+    ///   [1]      uint8_t  type (0x01 move, 0x02 button, 0x03 wheel, 0x04 key, 0x05 release_all)
+    ///   [2]      uint8_t  flags (reserved)
+    ///   [3]      uint8_t  reserved
+    ///   [4..7]   uint32_t seq
+    ///   [8..15]  uint64_t timestamp_us
+    ///   [16..]   payload (depends on type)
     ///
     /// @param data  Valid only for the duration of this call — copy if deferred.
     /// @param size  Number of bytes.

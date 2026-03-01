@@ -167,15 +167,26 @@ struct IceServer {
 /// Configuration passed to IWebRTCHost::initialize().
 struct WebRTCConfig {
     std::vector<IceServer> ice_servers;
-    std::string input_channel_label = "input";
-    int         ice_backup_candidate_pair_ping_interval_ms = 1000;
-    int         ice_connection_receiving_timeout_ms = 10000;
+
+    // DataChannel labels for the dual-channel input protocol (Stage 4).
+    //   fast_input_channel_label    — unreliable, unordered; high-rate mouse movement.
+    //   reliable_input_channel_label — ordered, reliable; buttons, keyboard, wheel.
+    std::string fast_input_channel_label     = "input.fast";
+    std::string reliable_input_channel_label = "input.reliable";
+
+    int  ice_backup_candidate_pair_ping_interval_ms = 1000;
+    int  ice_connection_receiving_timeout_ms = 10000;
+    // Restrict ICE to a specific UDP port range (inclusive).
+    // Required when only specific UDP ports are forwarded through NAT.
+    // 0/0 = let the OS pick (default, LAN / localhost use).
+    int  min_ice_port = 0;
+    int  max_ice_port = 0;
     // Sender-side RTP limits applied via RtpSender::SetParameters.
-    int         video_max_framerate = 60;
-    int         video_min_bitrate_bps = 2'000'000;
-    int         video_max_bitrate_bps = 15'000'000;
+    int  video_max_framerate = 60;
+    int  video_min_bitrate_bps = 2'000'000;
+    int  video_max_bitrate_bps = 15'000'000;
     // true = keep resolution/frame-rate fixed (disable adaptation).
-    bool        disable_video_adaptation = false;
+    bool disable_video_adaptation = false;
 };
 
 } // namespace gamestream

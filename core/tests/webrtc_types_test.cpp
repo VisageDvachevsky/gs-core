@@ -216,9 +216,22 @@ TEST(IceServerTest, TurnServerHasCredentials) {
 // WebRTCConfig
 // ===========================================================================
 
-TEST(WebRTCConfigTest, DefaultInputChannelLabelIsInput) {
+TEST(WebRTCConfigTest, DefaultFastInputChannelLabelIsInputFast) {
     WebRTCConfig cfg;
-    EXPECT_EQ(cfg.input_channel_label, "input");
+    EXPECT_EQ(cfg.fast_input_channel_label, "input.fast");
+}
+
+TEST(WebRTCConfigTest, DefaultReliableInputChannelLabelIsInputReliable) {
+    WebRTCConfig cfg;
+    EXPECT_EQ(cfg.reliable_input_channel_label, "input.reliable");
+}
+
+TEST(WebRTCConfigTest, InputChannelLabelsAreWritable) {
+    WebRTCConfig cfg;
+    cfg.fast_input_channel_label     = "custom.fast";
+    cfg.reliable_input_channel_label = "custom.reliable";
+    EXPECT_EQ(cfg.fast_input_channel_label,     "custom.fast");
+    EXPECT_EQ(cfg.reliable_input_channel_label, "custom.reliable");
 }
 
 TEST(WebRTCConfigTest, DefaultIceServersListIsEmpty) {
