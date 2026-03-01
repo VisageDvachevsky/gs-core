@@ -93,15 +93,17 @@ Your GPU is **RX 6700 XT** with **VCN 3.0** hardware encoder.
 
 ## 4. Input Handling
 
-### ✅ SendInput() + Raw Input API
+### ✅ Dual DataChannel + SendInput()
 
-| Method | Latency | Works with AC |
-|--------|---------|---|
-| **SendInput()** | <0.1 ms | ❌ Some AC blocks it |
-| **Raw Input** | <0.5 ms | ❌ Some AC blocks it |
+| Layer | Purpose | Delivery Guarantees |
+|-------|---------|---|
+| **`input.fast`** | Relative mouse move (`movementX/Y`) | Unordered + Unreliable |
+| **`input.reliable`** | Keyboard, mouse buttons, wheel, `RELEASE_ALL` | Ordered + Reliable |
+| **SendInput()** | Windows input injection | <0.1 ms API call |
 
+**Why this split**: Mouse move is high-frequency and self-correcting, but key/button events must not be dropped.
 **For MVP**: Death Stranding has no anti-cheat. Acceptable.
-**Future**: PHASE 6+ consider kernel driver (dangerous).
+**Future**: PHASE 6+ consider alternatives for anti-cheat-restricted games.
 
 ---
 

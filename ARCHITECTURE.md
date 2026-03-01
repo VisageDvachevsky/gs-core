@@ -1,6 +1,6 @@
 # 🧠 GameStream — Архитектура системы
 
-**Status**: Development (PHASE 4: Input Pipeline)
+**Status**: Development (PHASE 4 complete, PHASE 5 planning)
 **Target**: Death Stranding @ 1080p60 WebRTC with <80ms latency
 
 ---
@@ -14,14 +14,14 @@ CLIENT (Browser)
 ├─ React + TypeScript UI
 ├─ WebRTC Peer Connection (P2P + TURN)
 ├─ Video Decoding (H.264)
-└─ Gamepad/Mouse Input (DataChannel)
+└─ Keyboard/Mouse Input (DataChannel, Gamepad TODO)
         ↕️ WebRTC (UDP, +25–45ms internet latency)
 SERVER (Your PC)
 ├─ Streaming Core (C++20)
 │  ├─ WGC / DXGI Capture (GPU capture <2ms)
 │  ├─ AMD AMF H.264 Encoder (5–8ms encode)
 │  ├─ libwebrtc (RTP transport)
-│  └─ SendInput() / Raw Input (control injection)
+│  └─ Dual DataChannel ingest + SendInput() (control injection)
 ├─ Signal Server (Python FastAPI)
 │  ├─ REST API (/session/start, /session/stop)
 │  ├─ WebSocket (ICE candidates, SDP)
@@ -61,7 +61,7 @@ SERVER (Your PC)
 | Video Capture | WGC / DXGI | WGC for windows, DXGI as fallback. <2ms latency |
 | GPU Encoder | AMD AMF H.264 | VCN 3.0: 1-frame latency vs NVENC (2–3) |
 | WebRTC | libwebrtc native C++ | Zero-copy RTP payload |
-| Input | SendInput() + Raw Input | <0.1ms Windows API |
+| Input | `input.fast` + `input.reliable` + SendInput() | Relative mouse on fast lane, reliable discrete events |
 | Codec | H.264 baseline | Max browser compatibility, fast decode |
 
 ### Signal Server (Python 3.11+)
@@ -74,7 +74,7 @@ SERVER (Your PC)
 ### Client (React + TypeScript)
 
 - **Video**: <video> tag with WebRTC stream
-- **Input**: Gamepad API + Mouse listener
+- **Input**: Keyboard/Mouse listeners (Gamepad TODO)
 - **Signaling**: WebSocket to FastAPI
 
 ---
@@ -86,8 +86,8 @@ SERVER (Your PC)
 | 1 | Local DXGI + AMF capture PoC | 1–2 weeks | ✅ Done |
 | 2 | WebRTC integration (localhost) | 1–2 weeks | ✅ Done |
 | 3 | Signaling server (internet ready) | 3–5 days | ✅ Done |
-| 4 | Input pipeline (DataChannel + SendInput) | 3–5 days | 🟡 In Progress |
-| 5 | Web client UI + optimization + monitoring | 2+ weeks | 📋 Later |
+| 4 | Input pipeline (dual DataChannel + SendInput) | 3–5 days | ✅ Done |
+| 5 | Web client UI + optimization + monitoring | 2+ weeks | 📋 Planning |
 
 ---
 

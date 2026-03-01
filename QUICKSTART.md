@@ -14,7 +14,7 @@
 Твой PC:
     • Ядро: C++20 (DXGI + AMF H.264 + libwebrtc)
     • Сервер: Python FastAPI + WebSocket + Redis
-    • Ввод: SendInput() + Raw Input API
+    • Ввод: Dual DataChannel (input.fast/input.reliable) + SendInput()
 ```
 
 ---
@@ -25,7 +25,7 @@
 |-----------|-----------|--------|
 | **Core** | C++20: DXGI + AMF + libwebrtc | Минимум задержек, нативные API |
 | **Server** | Python 3.11: FastAPI + WebSocket | Асинхронный, простой deploy |
-| **Client** | React: TypeScript + Gamepad API | WebRTC API слабо типизирован |
+| **Client** | React: TypeScript + Keyboard/Mouse input (Gamepad TODO) | WebRTC API слабо типизирован |
 | **Codec** | H.264 baseline | Максимум совместимости, низкая задержка |
 | **GPU Encoder** | AMD AMF (RX 6700 XT) | 1-frame latency vs NVENC (2–3 frames) |
 | **Delivery** | WebRTC P2P + TURN fallback | <2 сек задержка, встроенное NAT traversal |
@@ -56,8 +56,8 @@ Input echo (клик → реакция на экране):
 1. **PHASE 1**: Local DXGI + AMF PoC (1–2 нед) ✅ Done
 2. **PHASE 2**: WebRTC locally (1–2 нед) ✅ Done
 3. **PHASE 3**: Signaling server (3–5 дн) ✅ Done
-4. **PHASE 4**: Input pipeline (3–5 дн) 🟡 In Progress
-5. **PHASE 5**: Web client + optimization + monitoring (2+ нед) 📋 Later
+4. **PHASE 4**: Input pipeline (dual DataChannel + SendInput) ✅ Done
+5. **PHASE 5**: Web client + optimization + monitoring (2+ нед) 📋 Planning
 
 ---
 
@@ -94,5 +94,5 @@ Input echo (клик → реакция на экране):
 
 ---
 
-**Status**: 🟡 PHASE 4 in progress
-**Следующий шаг**: Реализовать input pipeline через DataChannel + SendInput.
+**Status**: 📋 PHASE 5 planning (PHASE 4 complete)
+**Следующий шаг**: Интеграционный e2e сценарий "игра в браузере + удаленный ввод" и UI полировка.

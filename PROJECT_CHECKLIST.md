@@ -2,7 +2,7 @@
 
 **Purpose**: Confirm all architectural decisions before development starts
 **Date**: 2026-02-24
-**Status**: In Development (Phase 4)
+**Status**: In Development (Phase 4 complete, Phase 5 planning)
 
 ---
 
@@ -49,9 +49,10 @@
   - Enables DXGI capture
   - Impact: ~15% performance reduction (Death Stranding still >144 FPS)
 
-- [x] **SendInput() + Raw Input API** for input
-  - <0.1 ms latency
-  - Limitation: Some anti-cheat games block it (Death Stranding doesn't)
+- [x] **Dual DataChannel input pipeline + SendInput()** for input
+  - `input.fast` (unordered/unreliable) for relative mouse move
+  - `input.reliable` (ordered/reliable) for keyboard/buttons/wheel/RELEASE_ALL
+  - Limitation: Some anti-cheat games block SendInput (Death Stranding doesn't)
 
 ### WebRTC & Signaling
 
@@ -141,7 +142,7 @@
 **PHASE 1**: DXGI captures @ 60 FPS, H.264 file output, <5ms latency ✅
 **PHASE 2**: WebRTC P2P works locally, <10ms e2e latency ✅
 **PHASE 3**: Signal server handles multiple clients, internet-ready ✅ Complete
-**PHASE 4**: Friend can play via browser, input responds 📋
+**PHASE 4**: Friend can play via browser, dual-channel input responds ✅ Complete
 **PHASE 5**: Consistent <80ms echo latency over real internet 📋
 
 ---
@@ -164,7 +165,7 @@ Ready for PHASE 1?      → ✅ STARTED
 
 Developer: (You)
 Date: 2026-02-24
-Approval: Architecture approved and implemented up to Phase 4 kickoff
+Approval: Architecture approved and implemented through Phase 4 completion
 
 ---
 
